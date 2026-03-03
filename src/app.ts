@@ -163,54 +163,58 @@ async function handleMessage(
   let resultMeta: { turns?: number; durationMs?: number; costUsd?: number; subtype?: string } = {};
   let lastCardUpdate = 0;
 
-  function buildBlocks(): any[] {
-    const blocks: any[] = [];
+  function buildTaskCard(): any {
+    const statusMap = { thinking: "pending", working: "in_progress", done: "complete", error: "error" };
+    const card: any = {
+      type: "task_card",
+      task_id: threadTs,
+      title: truncate(prompt, 100),
+      status: statusMap[status],
+    };
 
-    // Status header
-    const statusIcon = status === "thinking" ? "⏳" : status === "working" ? "⚙️" : status === "done" ? "✅" : "❌";
-    const statusText = status === "thinking" ? "Thinking..." : status === "working" ? "Working..." : status === "done" ? "Done" : "Error";
-    blocks.push({
-      type: "context",
-      elements: [{ type: "mrkdwn", text: `${statusIcon}  *${statusText}*` }],
-    });
-
-    // Activity log (last 10 to stay under block limits)
+    // Activity log as details (bullet list)
     const shown = activities.slice(-10);
     if (shown.length > 0) {
-      blocks.push({ type: "divider" });
-      for (const a of shown) {
-        blocks.push({
-          type: "context",
-          elements: [{ type: "mrkdwn", text: `\`▸\` ${a.label}` }],
-        });
-      }
+      card.details = {
+        type: "rich_text",
+        elements: [{
+          type: "rich_text_list",
+          style: "bullet",
+          elements: shown.map(a => ({
+            type: "rich_text_section",
+            elements: [{ type: "text", text: a.label }],
+          })),
+        }],
+      };
     }
 
-    // Result metadata
+    // Result metadata as output (on completion)
     if (status === "done" || status === "error") {
-      blocks.push({ type: "divider" });
       const parts: string[] = [];
       if (resultMeta.turns) parts.push(`${resultMeta.turns} turns`);
       if (resultMeta.durationMs) parts.push(`${(resultMeta.durationMs / 1000).toFixed(1)}s`);
       if (resultMeta.costUsd) parts.push(`$${resultMeta.costUsd.toFixed(4)}`);
       if (resultMeta.subtype && resultMeta.subtype !== "success") parts.push(resultMeta.subtype);
       if (parts.length > 0) {
-        blocks.push({
-          type: "context",
-          elements: [{ type: "mrkdwn", text: parts.join("  ·  ") }],
-        });
+        card.output = {
+          type: "rich_text",
+          elements: [{
+            type: "rich_text_section",
+            elements: [{ type: "text", text: parts.join("  ·  ") }],
+          }],
+        };
       }
     }
 
-    return blocks;
+    return card;
   }
 
   // Post activity card
   const cardPost = await client.chat.postMessage({
     channel,
     thread_ts: threadTs,
-    text: "⏳ Thinking...",
-    blocks: buildBlocks(),
+    text: "Thinking...",
+    blocks: [buildTaskCard()],
   });
   const cardTs = cardPost.ts;
 
@@ -218,12 +222,11 @@ async function handleMessage(
     const now = Date.now();
     if (!force && now - lastCardUpdate < 1000) return;
     lastCardUpdate = now;
-    const blocks = buildBlocks();
     await client.chat.update({
       channel,
       ts: cardTs,
-      text: status === "done" ? "✅ Done" : status === "error" ? "❌ Error" : "⚙️ Working...",
-      blocks,
+      text: status === "done" ? "Done" : status === "error" ? "Error" : "Working...",
+      blocks: [buildTaskCard()],
     });
   }
 
@@ -419,7 +422,13 @@ async function shutdown(signal: string) {
       await app.client.chat.update({
         channel,
         ts: msgTs,
-        text: "_Restarting — send your message again._",
+        text: "Restarting — send your message again.",
+        blocks: [{
+          type: "task_card",
+          task_id: key,
+          title: "Restarting — send your message again.",
+          status: "error",
+        }],
       });
     } catch {}
     activeQueries.delete(key);
