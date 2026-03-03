@@ -1,5 +1,5 @@
 import "dotenv/config";
-import { readFileSync } from "node:fs";
+import { readFileSync, mkdirSync, readdirSync, existsSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import bolt from "@slack/bolt";
@@ -11,6 +11,42 @@ const { App, LogLevel } = bolt;
 // Load bot persona from BOT.md at startup
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const botPersona = readFileSync(resolve(__dirname, "../BOT.md"), "utf-8");
+
+// Workspaces root — each channel gets its own directory
+const WORKSPACES_ROOT = resolve(process.env.HOME || "/home/slacker", "workspaces");
+mkdirSync(WORKSPACES_ROOT, { recursive: true });
+
+// Channel name cache (resolved lazily)
+const channelNameCache = new Map<string, string>();
+
+async function resolveChannelName(client: any, channelId: string): Promise<string> {
+  const cached = channelNameCache.get(channelId);
+  if (cached) return cached;
+  try {
+    const info = await client.conversations.info({ channel: channelId });
+    const name = info.channel?.name || channelId;
+    channelNameCache.set(channelId, name);
+    return name;
+  } catch {
+    return channelId;
+  }
+}
+
+function getWorkspacePath(channelName: string): string {
+  const wsPath = resolve(WORKSPACES_ROOT, channelName);
+  mkdirSync(wsPath, { recursive: true });
+  return wsPath;
+}
+
+function listWorkspaces(): string[] {
+  if (!existsSync(WORKSPACES_ROOT)) return [];
+  return readdirSync(WORKSPACES_ROOT, { withFileTypes: true })
+    .filter((d) => d.isDirectory())
+    .map((d) => d.name);
+}
+
+// Track session IDs per thread for conversation continuity
+const threadSessions = new Map<string, string>();
 
 function log(level: "info" | "warn" | "error", msg: string, data?: Record<string, unknown>) {
   const entry = { ts: new Date().toISOString(), level, msg, ...data };
@@ -66,18 +102,33 @@ async function handleMessage(
     return;
   }
 
-  log("info", "handling message", { prompt, channel, threadTs, userId });
+  // Resolve channel name for workspace directory
+  const channelName = await resolveChannelName(client, channel);
+  const isDM = channelName === channel; // couldn't resolve = DM
+  const workspace = isDM ? resolve(WORKSPACES_ROOT, "_dm") : getWorkspacePath(channelName);
+  const otherWorkspaces = listWorkspaces()
+    .filter((w) => w !== channelName && w !== "_dm")
+    .map((w) => resolve(WORKSPACES_ROOT, w));
+
+  log("info", "handling message", { prompt, channel, channelName, threadTs, userId, workspace });
 
   const threadContext = await getThreadContext(client, channel, threadTs);
 
   const slackContext = [
     `# Slack Context`,
     `You are responding inside a Slack conversation. Use these values when calling Slack tools:`,
-    `- **Channel ID:** ${channel}`,
+    `- **Channel:** #${channelName} (${channel})`,
     `- **Thread TS:** ${threadTs}`,
     `- **User ID:** ${userId}`,
     ``,
     `When using Slack tools (post_message, upload_file, react, etc.), use the channel and thread_ts above — do NOT ask the user for them.`,
+    ``,
+    `# Workspace`,
+    `Your working directory is \`${workspace}\` — this is #${channelName}'s workspace.`,
+    `Each channel has its own workspace under \`${WORKSPACES_ROOT}/\`.`,
+    otherWorkspaces.length > 0
+      ? `Other channel workspaces you can access: ${otherWorkspaces.map((w) => `\`${w}\``).join(", ")}`
+      : `No other channel workspaces exist yet.`,
   ].join("\n");
 
   const fullPrompt = threadContext
@@ -106,17 +157,23 @@ async function handleMessage(
     });
   }
 
+  // Resume previous session for this thread if one exists
+  const previousSessionId = threadSessions.get(threadTs);
+
   try {
     const response = query({
       prompt: fullPrompt,
       options: {
+        cwd: workspace,
+        additionalDirectories: otherWorkspaces,
+        ...(previousSessionId ? { resume: previousSessionId } : {}),
         systemPrompt: {
           type: "preset",
           preset: "claude_code",
           append: botPersona,
         },
         allowedTools: [
-          "Read", "Write", "Edit", "Bash", "Glob", "Grep",
+          "Read", "Write", "Edit", "Bash", "Glob", "Grep", "Agent",
           "mcp__slack__post_message",
           "mcp__slack__react",
           "mcp__slack__upload_file",
@@ -136,6 +193,10 @@ async function handleMessage(
 
     for await (const message of response) {
       if (message.type === "system") {
+        // Track session ID for thread continuity
+        if (message.session_id) {
+          threadSessions.set(threadTs, message.session_id);
+        }
         log("info", "sdk init", {
           sessionId: message.session_id,
           model: message.model,
