@@ -1,10 +1,15 @@
 import "dotenv/config";
 import { readFileSync, mkdirSync, readdirSync, existsSync } from "node:fs";
+import { execSync } from "node:child_process";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import bolt from "@slack/bolt";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { createSlackTools } from "./slack-tools.js";
+import {
+  createInstallationStore,
+  migrateFromEnv,
+} from "./installation-store.js";
 
 const { App, LogLevel } = bolt;
 
@@ -12,44 +17,54 @@ const { App, LogLevel } = bolt;
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const botPersona = readFileSync(resolve(__dirname, "../AGENT.md"), "utf-8");
 
-// Workspaces root — each channel gets its own directory
+// Capture git info at startup
+const repoRoot = resolve(__dirname, "..");
+const git = (cmd: string) => execSync(cmd, { cwd: repoRoot, encoding: "utf-8" }).trim();
+const gitCommit = git("git rev-parse --short HEAD");
+const gitDate = git("git log -1 --format=%ci");
+const gitChangelog = git("git log --oneline -15");
+const startedAt = new Date();
+
+// Workspaces root — each team+channel gets its own directory
 const WORKSPACES_ROOT = resolve(process.env.HOME || "/home/slacker", ".slacker", "workspaces");
 mkdirSync(WORKSPACES_ROOT, { recursive: true });
 
-// Channel name cache (resolved lazily)
+// Channel name cache (resolved lazily), keyed by teamId:channelId
 const channelNameCache = new Map<string, string>();
 
-async function resolveChannelName(client: any, channelId: string): Promise<string> {
-  const cached = channelNameCache.get(channelId);
+async function resolveChannelName(client: any, teamId: string, channelId: string): Promise<string> {
+  const cacheKey = `${teamId}:${channelId}`;
+  const cached = channelNameCache.get(cacheKey);
   if (cached) return cached;
   try {
     const info = await client.conversations.info({ channel: channelId });
     const name = info.channel?.name || channelId;
-    channelNameCache.set(channelId, name);
+    channelNameCache.set(cacheKey, name);
     return name;
   } catch {
     return channelId;
   }
 }
 
-function getWorkspacePath(channelName: string): string {
-  const wsPath = resolve(WORKSPACES_ROOT, channelName);
+function getWorkspacePath(teamId: string, channelName: string): string {
+  const wsPath = resolve(WORKSPACES_ROOT, teamId, channelName);
   mkdirSync(wsPath, { recursive: true });
   return wsPath;
 }
 
-function listWorkspaces(): string[] {
-  if (!existsSync(WORKSPACES_ROOT)) return [];
-  return readdirSync(WORKSPACES_ROOT, { withFileTypes: true })
+function listWorkspaces(teamId: string): string[] {
+  const teamRoot = resolve(WORKSPACES_ROOT, teamId);
+  if (!existsSync(teamRoot)) return [];
+  return readdirSync(teamRoot, { withFileTypes: true })
     .filter((d) => d.isDirectory())
     .map((d) => d.name);
 }
 
-// Track session IDs per thread for conversation continuity
+// Track session IDs per thread for conversation continuity, keyed by teamId:threadTs
 const threadSessions = new Map<string, string>();
 
 // Track active queries so we can clean up on shutdown
-type ActiveQuery = { channel: string; msgTs: string; abort: AbortController };
+type ActiveQuery = { channel: string; msgTs: string; abort: AbortController; client: any };
 const activeQueries = new Map<string, ActiveQuery>();
 
 function log(level: "info" | "warn" | "error", msg: string, data?: Record<string, unknown>) {
@@ -57,15 +72,89 @@ function log(level: "info" | "warn" | "error", msg: string, data?: Record<string
   console[level](JSON.stringify(entry));
 }
 
+// --- Installation store (SQLite-backed) ---
+const installationStore = createInstallationStore();
+
+// --- Build App with OAuth config or legacy token ---
+const clientId = process.env.SLACK_CLIENT_ID;
+const clientSecret = process.env.SLACK_CLIENT_SECRET;
+const useOAuth = !!(clientId && clientSecret);
+
 const app = new App({
-  token: process.env.SLACK_BOT_TOKEN,
+  // OAuth config (when clientId/clientSecret are set, Bolt uses InstallationStore for auth)
+  ...(useOAuth
+    ? {
+        clientId,
+        clientSecret,
+        stateSecret: process.env.STATE_SECRET || "slacker-state-secret",
+        installationStore,
+        scopes: [
+          "chat:write",
+          "app_mentions:read",
+          "channels:history",
+          "groups:history",
+          "im:history",
+          "mpim:history",
+          "commands",
+          "files:read",
+          "files:write",
+          "reactions:write",
+          "pins:write",
+          "channels:read",
+          "users:read",
+          "canvases:write",
+        ],
+        installerOptions: {
+          directInstall: true,
+          callbackOptions: {
+            success: (_installation, _options, _req, res) => {
+              res.writeHead(200, { "Content-Type": "text/html" });
+              res.end(`
+                <!DOCTYPE html>
+                <html>
+                <head><title>Installed</title><style>
+                  body { font-family: -apple-system, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; background: #1a1a2e; color: #fff; }
+                  .card { text-align: center; padding: 48px; }
+                  h1 { font-size: 24px; margin-bottom: 8px; }
+                  p { color: #999; }
+                </style></head>
+                <body><div class="card"><h1>Slacker installed!</h1><p>Head back to Slack and mention @Slacker to get started.</p></div></body>
+                </html>
+              `);
+            },
+            failure: (error, _options, _req, res) => {
+              res.writeHead(500, { "Content-Type": "text/html" });
+              res.end(`
+                <!DOCTYPE html>
+                <html>
+                <head><title>Installation Failed</title><style>
+                  body { font-family: -apple-system, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; background: #1a1a2e; color: #fff; }
+                  .card { text-align: center; padding: 48px; }
+                  h1 { font-size: 24px; margin-bottom: 8px; }
+                  p { color: #999; }
+                  code { background: #333; padding: 2px 8px; border-radius: 4px; font-size: 14px; }
+                </style></head>
+                <body><div class="card"><h1>Installation failed</h1><p><code>${error.message}</code></p><p>Please try again.</p></div></body>
+                </html>
+              `);
+            },
+          },
+        },
+      }
+    : {
+        // Legacy single-workspace mode
+        token: process.env.SLACK_BOT_TOKEN,
+      }),
+
+  // Always required
   appToken: process.env.SLACK_APP_TOKEN,
   signingSecret: process.env.SLACK_SIGNING_SECRET,
   socketMode: true,
+  ...(useOAuth && process.env.OAUTH_REDIRECT_URI
+    ? { redirectUri: process.env.OAUTH_REDIRECT_URI }
+    : {}),
   logLevel: LogLevel.WARN,
 });
-
-const slackTools = createSlackTools(app.client);
 
 async function getThreadContext(client: any, channel: string, threadTs: string): Promise<string> {
   try {
@@ -106,15 +195,20 @@ async function handleMessage(
     return;
   }
 
-  // Resolve channel name for workspace directory
-  const channelName = await resolveChannelName(client, channel);
-  const isDM = channelName === channel; // couldn't resolve = DM
-  const workspace = isDM ? resolve(WORKSPACES_ROOT, "_dm") : getWorkspacePath(channelName);
-  const otherWorkspaces = listWorkspaces()
-    .filter((w) => w !== channelName && w !== "_dm")
-    .map((w) => resolve(WORKSPACES_ROOT, w));
+  // Create per-event Slack tools using the workspace-scoped client
+  const slackTools = createSlackTools(client);
 
-  log("info", "handling message", { prompt, channel, channelName, threadTs, userId, workspace });
+  // Resolve channel name for workspace directory (team-scoped)
+  const channelName = await resolveChannelName(client, teamId, channel);
+  const isDM = channelName === channel; // couldn't resolve = DM
+  const workspace = isDM
+    ? resolve(WORKSPACES_ROOT, teamId, "_dm")
+    : getWorkspacePath(teamId, channelName);
+  const otherWorkspaces = listWorkspaces(teamId)
+    .filter((w) => w !== channelName && w !== "_dm")
+    .map((w) => resolve(WORKSPACES_ROOT, teamId, w));
+
+  log("info", "handling message", { prompt, channel, channelName, threadTs, userId, teamId, workspace });
 
   const threadContext = await getThreadContext(client, channel, threadTs);
 
@@ -129,7 +223,7 @@ async function handleMessage(
     ``,
     `# Workspace`,
     `Your working directory is \`${workspace}\` — this is #${channelName}'s workspace.`,
-    `Each channel has its own workspace under \`${WORKSPACES_ROOT}/\`.`,
+    `Each channel has its own workspace under \`${resolve(WORKSPACES_ROOT, teamId)}/\`.`,
     otherWorkspaces.length > 0
       ? `Other channel workspaces you can access: ${otherWorkspaces.map((w) => `\`${w}\``).join(", ")}`
       : `No other channel workspaces exist yet.`,
@@ -157,38 +251,30 @@ async function handleMessage(
     return s.length > n ? s.slice(0, n - 1) + "…" : s;
   }
 
-  type Activity = { tool: string; label: string; ts: number };
+  type Activity = { tool: string; label: string; ts: number; status: "pending" | "in_progress" | "complete" | "error" };
   const activities: Activity[] = [];
   let status: "thinking" | "working" | "done" | "error" = "thinking";
   let resultMeta: { turns?: number; durationMs?: number; costUsd?: number; subtype?: string } = {};
   let lastCardUpdate = 0;
 
-  function buildTaskCard(): any {
-    const statusMap = { thinking: "pending", working: "in_progress", done: "complete", error: "error" };
-    const card: any = {
-      type: "task_card",
-      task_id: threadTs,
-      title: truncate(prompt, 100),
-      status: statusMap[status],
+  function buildPlanBlock(): any {
+    const plan: any = {
+      type: "plan",
+      title: { type: "plain_text", text: truncate(prompt, 100) },
     };
 
-    // Activity log as details (bullet list)
+    // Each activity becomes a task_card in the plan
     const shown = activities.slice(-10);
     if (shown.length > 0) {
-      card.details = {
-        type: "rich_text",
-        elements: [{
-          type: "rich_text_list",
-          style: "bullet",
-          elements: shown.map(a => ({
-            type: "rich_text_section",
-            elements: [{ type: "text", text: a.label }],
-          })),
-        }],
-      };
+      plan.tasks = shown.map((a, i) => ({
+        type: "task_card",
+        task_id: `${threadTs}_${i}`,
+        title: a.label,
+        status: a.status,
+      }));
     }
 
-    // Result metadata as output (on completion)
+    // On completion, add a summary task with result metadata
     if (status === "done" || status === "error") {
       const parts: string[] = [];
       if (resultMeta.turns) parts.push(`${resultMeta.turns} turns`);
@@ -196,17 +282,17 @@ async function handleMessage(
       if (resultMeta.costUsd) parts.push(`$${resultMeta.costUsd.toFixed(4)}`);
       if (resultMeta.subtype && resultMeta.subtype !== "success") parts.push(resultMeta.subtype);
       if (parts.length > 0) {
-        card.output = {
-          type: "rich_text",
-          elements: [{
-            type: "rich_text_section",
-            elements: [{ type: "text", text: parts.join("  ·  ") }],
-          }],
+        const summaryTask: any = {
+          type: "task_card",
+          task_id: `${threadTs}_summary`,
+          title: parts.join("  ·  "),
+          status: status === "done" ? "complete" : "error",
         };
+        plan.tasks = [...(plan.tasks || []), summaryTask];
       }
     }
 
-    return card;
+    return plan;
   }
 
   // Post activity card
@@ -214,7 +300,7 @@ async function handleMessage(
     channel,
     thread_ts: threadTs,
     text: "Thinking...",
-    blocks: [buildTaskCard()],
+    blocks: [buildPlanBlock()],
   });
   const cardTs = cardPost.ts;
 
@@ -226,15 +312,16 @@ async function handleMessage(
       channel,
       ts: cardTs,
       text: status === "done" ? "Done" : status === "error" ? "Error" : "Working...",
-      blocks: [buildTaskCard()],
+      blocks: [buildPlanBlock()],
     });
   }
 
-  // Resume previous session for this thread if one exists
-  const previousSessionId = threadSessions.get(threadTs);
+  // Resume previous session for this thread if one exists (team-scoped key)
+  const sessionKey = `${teamId}:${threadTs}`;
+  const previousSessionId = threadSessions.get(sessionKey);
   const abortController = new AbortController();
-  const queryKey = `${channel}:${threadTs}`;
-  activeQueries.set(queryKey, { channel, msgTs: cardTs!, abort: abortController });
+  const queryKey = `${teamId}:${channel}:${threadTs}`;
+  activeQueries.set(queryKey, { channel, msgTs: cardTs!, abort: abortController, client });
 
   let fullText = "";
 
@@ -271,7 +358,7 @@ async function handleMessage(
     for await (const message of response) {
       if (message.type === "system" && "subtype" in message && message.subtype === "init") {
         if (message.session_id) {
-          threadSessions.set(threadTs, message.session_id);
+          threadSessions.set(sessionKey, message.session_id);
         }
         log("info", "sdk init", {
           sessionId: message.session_id,
@@ -286,8 +373,12 @@ async function handleMessage(
         const toolUses = blocks.filter((b: any) => b.type === "tool_use");
 
         for (const tu of toolUses) {
+          // Mark previous activity as complete
+          if (activities.length > 0) {
+            activities[activities.length - 1].status = "complete";
+          }
           const label = toolLabel((tu as any).name, (tu as any).input);
-          activities.push({ tool: (tu as any).name, label, ts: Date.now() });
+          activities.push({ tool: (tu as any).name, label, ts: Date.now(), status: "in_progress" });
           status = "working";
           await updateCard();
         }
@@ -309,6 +400,10 @@ async function handleMessage(
           subtype: result.subtype,
         };
         status = result.subtype === "success" ? "done" : "error";
+        // Mark all remaining activities as complete (or error)
+        for (const a of activities) {
+          if (a.status !== "complete") a.status = status === "done" ? "complete" : "error";
+        }
 
         log("info", "sdk result", {
           subtype: result.subtype,
@@ -364,6 +459,25 @@ app.command("/ping", async ({ ack, respond }) => {
   await respond("pong!");
 });
 
+app.command("/version", async ({ ack, respond }) => {
+  await ack();
+  const uptime = Math.floor((Date.now() - startedAt.getTime()) / 1000);
+  const h = Math.floor(uptime / 3600);
+  const m = Math.floor((uptime % 3600) / 60);
+  const uptimeStr = h > 0 ? `${h}h ${m}m` : `${m}m`;
+  await respond(
+    `*Cofounder* v${process.env.npm_package_version || "1.0.0"}\n` +
+    `Commit: \`${gitCommit}\` (${gitDate})\n` +
+    `Uptime: ${uptimeStr}`,
+  );
+});
+
+app.command("/changelog", async ({ ack, respond }) => {
+  await ack();
+  const lines = gitChangelog.split("\n").map(l => `• ${l}`).join("\n");
+  await respond(`*Recent changes:*\n${lines}`);
+});
+
 app.event("app_mention", async ({ event, client, context }) => {
   log("info", "app_mention event", { user: event.user, channel: event.channel });
   const threadTs = event.thread_ts || event.ts;
@@ -372,7 +486,7 @@ app.event("app_mention", async ({ event, client, context }) => {
     event.channel,
     threadTs,
     context.teamId!,
-    event.user,
+    event.user!,
     client,
   );
 });
@@ -413,33 +527,77 @@ app.message(async ({ message, client, context }) => {
   );
 });
 
+// --- Uninstall handling ---
+app.event("app_uninstalled" as any, async ({ context }: any) => {
+  const teamId = context.teamId;
+  if (!teamId) return;
+  log("info", "app_uninstalled", { teamId });
+  try {
+    await installationStore.deleteInstallation!({
+      teamId,
+      enterpriseId: context.enterpriseId,
+      isEnterpriseInstall: false,
+    } as any);
+  } catch (error) {
+    log("error", "failed to delete installation on uninstall", { error: String(error), teamId });
+  }
+});
+
+app.event("tokens_revoked" as any, async ({ event, context }: any) => {
+  const teamId = context.teamId;
+  if (!teamId) return;
+  log("info", "tokens_revoked", { teamId, tokens: event.tokens });
+  // If bot tokens were revoked, remove the installation
+  if (event.tokens?.bot?.length > 0) {
+    try {
+      await installationStore.deleteInstallation!({
+        teamId,
+        enterpriseId: context.enterpriseId,
+        isEnterpriseInstall: false,
+      } as any);
+    } catch (error) {
+      log("error", "failed to delete installation on token revocation", { error: String(error), teamId });
+    }
+  }
+});
+
 // Graceful shutdown: update any in-flight "thinking..." messages
 async function shutdown(signal: string) {
   log("info", "shutting down", { signal, activeQueries: activeQueries.size });
-  for (const [key, { channel, msgTs, abort }] of activeQueries) {
+  for (const [key, { channel, msgTs, abort, client }] of activeQueries) {
     abort.abort();
     try {
-      await app.client.chat.update({
+      await client.chat.update({
         channel,
         ts: msgTs,
         text: "Restarting — send your message again.",
         blocks: [{
-          type: "task_card",
-          task_id: key,
-          title: "Restarting — send your message again.",
-          status: "error",
+          type: "plan",
+          title: { type: "plain_text", text: "Restarting — send your message again." },
+          tasks: [{
+            type: "task_card",
+            task_id: `${key}_restart`,
+            title: "Interrupted by restart",
+            status: "error",
+          }],
         }],
       });
     } catch {}
     activeQueries.delete(key);
   }
+  installationStore.close();
   process.exit(0);
 }
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
 
 (async () => {
+  // Migrate existing SLACK_BOT_TOKEN into SQLite if present
+  if (useOAuth) {
+    await migrateFromEnv(installationStore);
+  }
+
   await app.start();
-  log("info", "cofounder started");
+  log("info", "cofounder started", { mode: useOAuth ? "oauth" : "legacy" });
   console.log("\n--- AGENT.md ---\n" + botPersona + "--- END ---\n");
 })();
