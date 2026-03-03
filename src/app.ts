@@ -13,7 +13,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const botPersona = readFileSync(resolve(__dirname, "../BOT.md"), "utf-8");
 
 // Workspaces root — each channel gets its own directory
-const WORKSPACES_ROOT = resolve(process.env.HOME || "/home/slacker", "workspaces");
+const WORKSPACES_ROOT = resolve(process.env.HOME || "/home/slacker", ".slacker", "workspaces");
 mkdirSync(WORKSPACES_ROOT, { recursive: true });
 
 // Channel name cache (resolved lazily)
