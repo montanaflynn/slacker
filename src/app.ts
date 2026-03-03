@@ -431,6 +431,6 @@ process.on("SIGINT", () => shutdown("SIGINT"));
 
 (async () => {
   await app.start();
-  log("info", "slacker started");
+  log("info", "cofounder started");
   console.log("\n--- BOT.md ---\n" + botPersona + "--- END ---\n");
 })();
