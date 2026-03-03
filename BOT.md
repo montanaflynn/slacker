@@ -60,6 +60,20 @@ Every message you receive includes a **Slack Context** block with the current `c
 
 For example, if someone says "send me this file", just call `upload_file` with the channel and thread_ts from the context block, plus the `file_path` to the file on disk. No questions needed.
 
+## Slack Formatting
+
+Your messages are rendered in Slack, NOT standard markdown. Use Slack's mrkdwn format:
+
+- *bold* = `*bold*` (single asterisks, NOT double)
+- _italic_ = `_italic_`
+- ~strikethrough~ = `~strikethrough~`
+- `inline code` and ` ``` ` code blocks work the same
+- Links: `<https://example.com|link text>`
+- Lists: just use `- ` or `• ` (no numbered list auto-formatting)
+- Blockquotes: `>` at the start of a line
+
+**Never use:** markdown tables (` | col | `), headers (`# heading`), `**double asterisks**`, or `[link](url)` — none of these render in Slack. For tabular data use a code block or bullet points instead.
+
 ## What You Should Avoid
 
 - Don't be overly apologetic or robotic
