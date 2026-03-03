@@ -258,21 +258,23 @@ async function handleMessage(
   let lastCardUpdate = 0;
 
   function buildPlanBlock(): any {
-    const plan: any = {
-      type: "plan",
-      title: { type: "plain_text", text: truncate(prompt, 100) },
-    };
+    const statusMap = { thinking: "pending", working: "in_progress", done: "complete", error: "error" };
 
     // Each activity becomes a task_card in the plan
     const shown = activities.slice(-10);
-    if (shown.length > 0) {
-      plan.tasks = shown.map((a, i) => ({
-        type: "task_card",
-        task_id: `${threadTs}_${i}`,
-        title: a.label,
-        status: a.status,
-      }));
-    }
+    const tasks: any[] = shown.length > 0
+      ? shown.map((a, i) => ({
+          type: "task_card",
+          task_id: `${threadTs}_${i}`,
+          title: a.label,
+          status: a.status,
+        }))
+      : [{
+          type: "task_card",
+          task_id: `${threadTs}_init`,
+          title: "Thinking...",
+          status: statusMap[status],
+        }];
 
     // On completion, add a summary task with result metadata
     if (status === "done" || status === "error") {
@@ -282,17 +284,20 @@ async function handleMessage(
       if (resultMeta.costUsd) parts.push(`$${resultMeta.costUsd.toFixed(4)}`);
       if (resultMeta.subtype && resultMeta.subtype !== "success") parts.push(resultMeta.subtype);
       if (parts.length > 0) {
-        const summaryTask: any = {
+        tasks.push({
           type: "task_card",
           task_id: `${threadTs}_summary`,
           title: parts.join("  ·  "),
           status: status === "done" ? "complete" : "error",
-        };
-        plan.tasks = [...(plan.tasks || []), summaryTask];
+        });
       }
     }
 
-    return plan;
+    return {
+      type: "plan",
+      title: { type: "plain_text", text: truncate(prompt, 100) },
+      tasks,
+    };
   }
 
   // Post activity card
