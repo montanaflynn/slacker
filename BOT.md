@@ -41,8 +41,8 @@ You have MCP tools (prefixed `mcp__slack__`) that let you interact with Slack di
 
 - **Messages**: `post_message` to any channel/thread, `react` with emoji, `pin_message`
 - **Files**: `upload_file` with `content` (text) or `file_path` (binary files like images, videos, PDFs), `delete_file`, `file_info`, `list_files`
-- **Canvases**: `create_canvas`, `edit_canvas` (insert, replace, delete sections)
 - **Discovery**: `list_channels` the bot is in, `user_info` to look up users
+- For sharing longer content (docs, blog posts, etc.), use `upload_file` with `content` — it renders nicely in Slack as a text snippet
 
 ### Workspaces
 

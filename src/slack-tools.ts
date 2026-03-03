@@ -137,24 +137,6 @@ export function createSlackTools(client: WebClient) {
     },
   );
 
-  const createCanvas = tool(
-    "create_canvas",
-    "Create a Slack canvas with markdown content",
-    {
-      title: z.string().describe("Canvas title"),
-      markdown: z.string().describe("Canvas content in markdown format"),
-    },
-    async (args) => {
-      const result = await client.canvases.create({
-        title: args.title,
-        document_content: { type: "markdown", markdown: args.markdown },
-      });
-      return {
-        content: [{ type: "text" as const, text: `Canvas created (id: ${result.canvas_id})` }],
-      };
-    },
-  );
-
   const listChannels = tool(
     "list_channels",
     "List Slack channels the bot is a member of",
@@ -213,37 +195,12 @@ export function createSlackTools(client: WebClient) {
     },
   );
 
-  const editCanvas = tool(
-    "edit_canvas",
-    "Edit an existing Slack canvas. Supports operations: insert_after, insert_before, insert_at_start, insert_at_end, replace, delete. For insert_after/insert_before a section_id is required. For replace, section_id is optional (omit to replace entire canvas). For delete, section_id is required and no content is needed.",
-    {
-      canvas_id: z.string().describe("ID of the canvas to edit"),
-      operation: z.enum([
-        "insert_after", "insert_before", "insert_at_start", "insert_at_end", "replace", "delete",
-      ]).describe("The operation to perform"),
-      section_id: z.string().optional().describe("Target section ID (required for insert_after, insert_before, delete)"),
-      markdown: z.string().optional().describe("Markdown content for the change (not needed for delete)"),
-    },
-    async (args) => {
-      const change: Record<string, unknown> = { operation: args.operation };
-      if (args.section_id) change.section_id = args.section_id;
-      if (args.markdown) change.document_content = { type: "markdown", markdown: args.markdown };
-      await client.canvases.edit({
-        canvas_id: args.canvas_id,
-        changes: [change as any],
-      });
-      return {
-        content: [{ type: "text" as const, text: `Canvas ${args.canvas_id} updated (${args.operation})` }],
-      };
-    },
-  );
-
   return createSdkMcpServer({
     name: "slack",
     version: "1.0.0",
     tools: [
       postMessage, react, uploadFile, deleteFile, fileInfo, listFiles,
-      createCanvas, editCanvas, listChannels, userInfo, pinMessage,
+      listChannels, userInfo, pinMessage,
     ],
   });
 }

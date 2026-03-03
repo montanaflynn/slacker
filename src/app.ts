@@ -201,8 +201,6 @@ async function handleMessage(
           "mcp__slack__delete_file",
           "mcp__slack__file_info",
           "mcp__slack__list_files",
-          "mcp__slack__create_canvas",
-          "mcp__slack__edit_canvas",
           "mcp__slack__list_channels",
           "mcp__slack__user_info",
           "mcp__slack__pin_message",
