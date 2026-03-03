@@ -135,65 +135,38 @@ async function handleMessage(
     ? `${slackContext}\n\nHere is the conversation so far:\n\n${threadContext}\n\nNow respond to:\n${prompt}`
     : `${slackContext}\n\n${prompt}`;
 
-  // React to the user's message to acknowledge receipt
-  const userMsgTs = threadTs === text ? threadTs : undefined;
-  const reactTarget = userMsgTs || threadTs;
-  await react(client, channel, reactTarget, "eyes");
-
   // Post a placeholder immediately so the user sees something
   const posted = await client.chat.postMessage({
     channel,
     thread_ts: threadTs,
-    text: ":thinking_face: thinking...",
+    text: "_thinking..._",
   });
   const msgTs = posted.ts;
   let fullText = "";
+  let statusText = "_thinking..._";
   let lastUpdate = 0;
-  let currentToolEmoji: string | null = null;
 
-  // Emoji helpers
-  async function react(c: any, ch: string, ts: string, emoji: string) {
-    try { await c.reactions.add({ channel: ch, timestamp: ts, name: emoji }); } catch {}
-  }
-  async function unreact(c: any, ch: string, ts: string, emoji: string) {
-    try { await c.reactions.remove({ channel: ch, timestamp: ts, name: emoji }); } catch {}
-  }
-
-  // Tool name → emoji mapping
-  function toolEmoji(toolName: string): string {
-    if (toolName === "Bash") return "terminal";
-    if (toolName === "Read" || toolName === "Glob" || toolName === "Grep") return "mag";
-    if (toolName === "Write" || toolName === "Edit") return "pencil2";
-    if (toolName === "Agent") return "robot_face";
-    if (toolName.startsWith("mcp__slack__")) return "slack";
-    return "gear";
-  }
-
-  async function setToolStatus(toolName: string) {
-    const emoji = toolEmoji(toolName);
-    if (emoji !== currentToolEmoji) {
-      if (currentToolEmoji) await unreact(client, channel, msgTs!, currentToolEmoji);
-      await react(client, channel, msgTs!, emoji);
-      currentToolEmoji = emoji;
-    }
-  }
-
-  async function clearToolStatus() {
-    if (currentToolEmoji) {
-      await unreact(client, channel, msgTs!, currentToolEmoji);
-      currentToolEmoji = null;
-    }
+  // Tool name → human-readable status
+  function toolStatus(toolName: string): string {
+    if (toolName === "Bash") return "_running command..._";
+    if (toolName === "Read") return "_reading file..._";
+    if (toolName === "Glob") return "_searching files..._";
+    if (toolName === "Grep") return "_searching code..._";
+    if (toolName === "Write") return "_writing file..._";
+    if (toolName === "Edit") return "_editing file..._";
+    if (toolName === "Agent") return "_working on subtask..._";
+    if (toolName.startsWith("mcp__slack__")) return "_using slack..._";
+    return `_using ${toolName}..._`;
   }
 
   async function updateMessage(force = false) {
     const now = Date.now();
-    // Throttle updates to avoid rate limits (max every 500ms)
     if (!force && now - lastUpdate < 500) return;
     lastUpdate = now;
     await client.chat.update({
       channel,
       ts: msgTs,
-      text: fullText || ":thinking_face: thinking...",
+      text: fullText || statusText,
     });
   }
 
@@ -252,9 +225,10 @@ async function handleMessage(
           .filter((b: any) => b.type === "tool_use")
           .map((b: any) => b.name);
 
-        // Show tool status via emoji
-        if (toolUses.length > 0) {
-          await setToolStatus(toolUses[0]);
+        // Update status with what tool is being used
+        if (toolUses.length > 0 && !fullText) {
+          statusText = toolStatus(toolUses[0]);
+          await updateMessage();
         }
 
         log("info", "sdk assistant", {
@@ -277,21 +251,13 @@ async function handleMessage(
           errors: result.errors,
         });
 
-        await clearToolStatus();
-        await unreact(client, channel, reactTarget, "eyes");
-
-        if (result.subtype === "success") {
-          await react(client, channel, reactTarget, "white_check_mark");
-        } else if (result.subtype === "error_max_turns") {
+        if (result.subtype === "error_max_turns") {
           fullText += "\n\n_Hit the max turns limit — reply in this thread to continue._";
-          await react(client, channel, reactTarget, "warning");
         } else if (result.subtype === "error_during_execution") {
           const errors = result.errors?.join(", ") || "unknown error";
           fullText += `\n\n_Error: ${errors}_`;
-          await react(client, channel, reactTarget, "x");
         } else if (result.subtype === "error_max_budget_usd") {
           fullText += "\n\n_Hit the budget limit for this request._";
-          await react(client, channel, reactTarget, "moneybag");
         }
       } else if (message.type === "tool_use_summary") {
         log("info", "tool summary", { summary: (message as any).summary });
@@ -305,9 +271,6 @@ async function handleMessage(
     log("info", "stream complete", { threadTs });
   } catch (error) {
     log("error", "claude query failed", { error: String(error), threadTs });
-    await clearToolStatus();
-    await unreact(client, channel, reactTarget, "eyes");
-    await react(client, channel, reactTarget, "x");
     await client.chat.update({
       channel,
       ts: msgTs,
