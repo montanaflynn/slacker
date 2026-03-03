@@ -1,0 +1,22 @@
+{
+  "name": "slacker",
+  "version": "1.0.0",
+  "description": "Slack bot built with Bolt.js and programmatic app setup",
+  "type": "module",
+  "scripts": {
+    "start": "node --import tsx src/app.ts",
+    "dev": "node --import tsx --watch src/app.ts",
+    "setup": "node --import tsx scripts/setup.ts",
+    "update": "node --import tsx scripts/update.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.63",
+    "@slack/bolt": "^4.1.0",
+    "dotenv": "^16.4.7"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}

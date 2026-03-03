@@ -1,0 +1,66 @@
+{
+  "display_information": {
+    "name": "Slacker",
+    "description": "A simple Slack bot",
+    "background_color": "#2c2d30"
+  },
+  "features": {
+    "bot_user": {
+      "display_name": "Slacker",
+      "always_online": true
+    },
+    "app_home": {
+      "home_tab_enabled": false,
+      "messages_tab_enabled": true,
+      "messages_tab_read_only_enabled": false
+    },
+    "slash_commands": [
+      {
+        "command": "/ping",
+        "description": "Check if the bot is alive",
+        "usage_hint": " ",
+        "should_escape": false
+      }
+    ]
+  },
+  "oauth_config": {
+    "redirect_urls": [
+      "https://slack.com"
+    ],
+    "scopes": {
+      "bot": [
+        "chat:write",
+        "app_mentions:read",
+        "channels:history",
+        "groups:history",
+        "im:history",
+        "mpim:history",
+        "commands",
+        "files:read",
+        "files:write",
+        "reactions:write",
+        "pins:write",
+        "channels:read",
+        "users:read",
+        "canvases:write"
+      ]
+    }
+  },
+  "settings": {
+    "event_subscriptions": {
+      "bot_events": [
+        "message.channels",
+        "message.groups",
+        "message.im",
+        "message.mpim",
+        "app_mention"
+      ]
+    },
+    "interactivity": {
+      "is_enabled": true
+    },
+    "org_deploy_enabled": false,
+    "socket_mode_enabled": true,
+    "token_rotation_enabled": false
+  }
+}
