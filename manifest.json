@@ -20,6 +20,18 @@
         "description": "Check if the bot is alive",
         "usage_hint": " ",
         "should_escape": false
+      },
+      {
+        "command": "/version",
+        "description": "Show current commit and uptime",
+        "usage_hint": " ",
+        "should_escape": false
+      },
+      {
+        "command": "/changelog",
+        "description": "Show recent changes",
+        "usage_hint": " ",
+        "should_escape": false
       }
     ]
   },
@@ -53,7 +65,9 @@
         "message.groups",
         "message.im",
         "message.mpim",
-        "app_mention"
+        "app_mention",
+        "app_uninstalled",
+        "tokens_revoked"
       ]
     },
     "interactivity": {

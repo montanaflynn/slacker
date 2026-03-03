@@ -592,10 +592,9 @@ process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
 
 (async () => {
-  // Migrate existing SLACK_BOT_TOKEN into SQLite if present
-  if (useOAuth) {
-    await migrateFromEnv(installationStore);
-  }
+  // Migrate existing SLACK_BOT_TOKEN: always migrate workspace dirs,
+  // only store installation record when in OAuth mode
+  await migrateFromEnv(installationStore, useOAuth);
 
   await app.start();
   log("info", "cofounder started", { mode: useOAuth ? "oauth" : "legacy" });
