@@ -8,9 +8,9 @@ import { createSlackTools } from "./slack-tools.js";
 
 const { App, LogLevel } = bolt;
 
-// Load bot persona from BOT.md at startup
+// Load bot persona from AGENT.md at startup
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const botPersona = readFileSync(resolve(__dirname, "../BOT.md"), "utf-8");
+const botPersona = readFileSync(resolve(__dirname, "../AGENT.md"), "utf-8");
 
 // Workspaces root — each channel gets its own directory
 const WORKSPACES_ROOT = resolve(process.env.HOME || "/home/slacker", ".slacker", "workspaces");
@@ -432,5 +432,5 @@ process.on("SIGINT", () => shutdown("SIGINT"));
 (async () => {
   await app.start();
   log("info", "cofounder started");
-  console.log("\n--- BOT.md ---\n" + botPersona + "--- END ---\n");
+  console.log("\n--- AGENT.md ---\n" + botPersona + "--- END ---\n");
 })();
