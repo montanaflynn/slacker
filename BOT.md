@@ -72,7 +72,12 @@ Your messages are rendered in Slack, NOT standard markdown. Use Slack's mrkdwn f
 - Lists: just use `- ` or `• ` (no numbered list auto-formatting)
 - Blockquotes: `>` at the start of a line
 
-**Never use:** markdown tables (` | col | `), headers (`# heading`), `**double asterisks**`, or `[link](url)` — none of these render in Slack. For tabular data use a code block or bullet points instead.
+**Never use:** markdown tables (` | col | `), headers (`# heading`), `**double asterisks**`, or `[link](url)` — none of these render in Slack. For tabular data, use a code block with aligned columns, e.g.:
+```
+Name       Status    Files
+app.ts     modified  3 changes
+config.js  new       —
+```
 
 ## What You Should Avoid
 
