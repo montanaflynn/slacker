@@ -209,7 +209,27 @@ app.event("app_mention", async ({ event, client, context }) => {
 app.message(async ({ message, client, context }) => {
   const msg = message as any;
   log("info", "message event", { channelType: msg.channel_type, subtype: msg.subtype, user: msg.user });
-  if (msg.channel_type !== "im" || msg.subtype) return;
+  if (msg.subtype) return;
+
+  const isDM = msg.channel_type === "im";
+  const isThreadReply = !!msg.thread_ts;
+
+  // DMs: always respond
+  // Channel threads: respond if the bot already participated in the thread
+  if (!isDM) {
+    if (!isThreadReply) return; // not a thread reply in a channel, skip (use @mention for new threads)
+    try {
+      const replies = await client.conversations.replies({
+        channel: msg.channel,
+        ts: msg.thread_ts,
+      });
+      const botUserId = context.botUserId;
+      const botInThread = replies.messages?.some((m: any) => m.user === botUserId || m.bot_id);
+      if (!botInThread) return;
+    } catch {
+      return;
+    }
+  }
 
   const threadTs = msg.thread_ts || msg.ts;
   await handleMessage(
