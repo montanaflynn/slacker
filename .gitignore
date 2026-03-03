@@ -3,3 +3,6 @@ dist
 .env
 .sessions.json
 .claude
+*.db
+*.db-wal
+*.db-shm
