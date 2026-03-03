@@ -139,38 +139,91 @@ async function handleMessage(
     ? `${slackContext}\n\nHere is the conversation so far:\n\n${threadContext}\n\nNow respond to:\n${prompt}`
     : `${slackContext}\n\n${prompt}`;
 
-  // Post a placeholder immediately so the user sees something
-  const posted = await client.chat.postMessage({
-    channel,
-    thread_ts: threadTs,
-    text: "_thinking..._",
-  });
-  const msgTs = posted.ts;
-  let fullText = "";
-  let statusText = "_thinking..._";
-  let lastUpdate = 0;
-
-  // Tool name → human-readable status
-  function toolStatus(toolName: string): string {
-    if (toolName === "Bash") return "_running command..._";
-    if (toolName === "Read") return "_reading file..._";
-    if (toolName === "Glob") return "_searching files..._";
-    if (toolName === "Grep") return "_searching code..._";
-    if (toolName === "Write") return "_writing file..._";
-    if (toolName === "Edit") return "_editing file..._";
-    if (toolName === "Agent") return "_working on subtask..._";
-    if (toolName.startsWith("mcp__slack__")) return "_using slack..._";
-    return `_using ${toolName}..._`;
+  // --- Block Kit activity card ---
+  // Tool label helper
+  function toolLabel(name: string, input?: Record<string, any>): string {
+    if (name === "Bash") return `Bash: \`${truncate(input?.command || "...", 60)}\``;
+    if (name === "Read") return `Read \`${input?.file_path || "..."}\``;
+    if (name === "Glob") return `Glob \`${input?.pattern || "..."}\``;
+    if (name === "Grep") return `Grep \`${truncate(input?.pattern || "...", 40)}\``;
+    if (name === "Write") return `Write \`${input?.file_path || "..."}\``;
+    if (name === "Edit") return `Edit \`${input?.file_path || "..."}\``;
+    if (name === "Agent") return `Agent: ${truncate(input?.description || "subtask", 50)}`;
+    if (name.startsWith("mcp__slack__")) return `Slack: ${name.replace("mcp__slack__", "")}`;
+    return name;
   }
 
-  async function updateMessage(force = false) {
+  function truncate(s: string, n: number): string {
+    return s.length > n ? s.slice(0, n - 1) + "…" : s;
+  }
+
+  type Activity = { tool: string; label: string; ts: number };
+  const activities: Activity[] = [];
+  let status: "thinking" | "working" | "done" | "error" = "thinking";
+  let resultMeta: { turns?: number; durationMs?: number; costUsd?: number; subtype?: string } = {};
+  let lastCardUpdate = 0;
+
+  function buildBlocks(): any[] {
+    const blocks: any[] = [];
+
+    // Status header
+    const statusIcon = status === "thinking" ? "⏳" : status === "working" ? "⚙️" : status === "done" ? "✅" : "❌";
+    const statusText = status === "thinking" ? "Thinking..." : status === "working" ? "Working..." : status === "done" ? "Done" : "Error";
+    blocks.push({
+      type: "context",
+      elements: [{ type: "mrkdwn", text: `${statusIcon}  *${statusText}*` }],
+    });
+
+    // Activity log (last 10 to stay under block limits)
+    const shown = activities.slice(-10);
+    if (shown.length > 0) {
+      blocks.push({ type: "divider" });
+      for (const a of shown) {
+        blocks.push({
+          type: "context",
+          elements: [{ type: "mrkdwn", text: `\`▸\` ${a.label}` }],
+        });
+      }
+    }
+
+    // Result metadata
+    if (status === "done" || status === "error") {
+      blocks.push({ type: "divider" });
+      const parts: string[] = [];
+      if (resultMeta.turns) parts.push(`${resultMeta.turns} turns`);
+      if (resultMeta.durationMs) parts.push(`${(resultMeta.durationMs / 1000).toFixed(1)}s`);
+      if (resultMeta.costUsd) parts.push(`$${resultMeta.costUsd.toFixed(4)}`);
+      if (resultMeta.subtype && resultMeta.subtype !== "success") parts.push(resultMeta.subtype);
+      if (parts.length > 0) {
+        blocks.push({
+          type: "context",
+          elements: [{ type: "mrkdwn", text: parts.join("  ·  ") }],
+        });
+      }
+    }
+
+    return blocks;
+  }
+
+  // Post activity card
+  const cardPost = await client.chat.postMessage({
+    channel,
+    thread_ts: threadTs,
+    text: "⏳ Thinking...",
+    blocks: buildBlocks(),
+  });
+  const cardTs = cardPost.ts;
+
+  async function updateCard(force = false) {
     const now = Date.now();
-    if (!force && now - lastUpdate < 500) return;
-    lastUpdate = now;
+    if (!force && now - lastCardUpdate < 1000) return;
+    lastCardUpdate = now;
+    const blocks = buildBlocks();
     await client.chat.update({
       channel,
-      ts: msgTs,
-      text: fullText || statusText,
+      ts: cardTs,
+      text: status === "done" ? "✅ Done" : status === "error" ? "❌ Error" : "⚙️ Working...",
+      blocks,
     });
   }
 
@@ -178,7 +231,9 @@ async function handleMessage(
   const previousSessionId = threadSessions.get(threadTs);
   const abortController = new AbortController();
   const queryKey = `${channel}:${threadTs}`;
-  activeQueries.set(queryKey, { channel, msgTs: msgTs!, abort: abortController });
+  activeQueries.set(queryKey, { channel, msgTs: cardTs!, abort: abortController });
+
+  let fullText = "";
 
   try {
     const response = query({
@@ -212,14 +267,12 @@ async function handleMessage(
 
     for await (const message of response) {
       if (message.type === "system" && "subtype" in message && message.subtype === "init") {
-        // Track session ID for thread continuity
         if (message.session_id) {
           threadSessions.set(threadTs, message.session_id);
         }
         log("info", "sdk init", {
           sessionId: message.session_id,
           model: (message as any).model,
-          tools: (message as any).tools,
         });
       } else if (message.type === "assistant") {
         const blocks = message.message.content;
@@ -227,27 +280,33 @@ async function handleMessage(
           .filter((b: any) => b.type === "text")
           .map((b: any) => b.text)
           .join("");
-        const toolUses = blocks
-          .filter((b: any) => b.type === "tool_use")
-          .map((b: any) => b.name);
+        const toolUses = blocks.filter((b: any) => b.type === "tool_use");
 
-        // Update status with what tool is being used
-        if (toolUses.length > 0 && !fullText) {
-          statusText = toolStatus(toolUses[0]);
-          await updateMessage();
+        for (const tu of toolUses) {
+          const label = toolLabel((tu as any).name, (tu as any).input);
+          activities.push({ tool: (tu as any).name, label, ts: Date.now() });
+          status = "working";
+          await updateCard();
         }
 
         log("info", "sdk assistant", {
           textLength: textContent.length,
-          toolUses: toolUses.length ? toolUses : undefined,
+          toolUses: toolUses.length ? toolUses.map((t: any) => t.name) : undefined,
         });
 
         if (textContent) {
           fullText += textContent;
-          await updateMessage();
         }
       } else if (message.type === "result") {
         const result = message as any;
+        resultMeta = {
+          turns: result.num_turns,
+          durationMs: result.duration_ms,
+          costUsd: result.total_cost_usd,
+          subtype: result.subtype,
+        };
+        status = result.subtype === "success" ? "done" : "error";
+
         log("info", "sdk result", {
           subtype: result.subtype,
           isError: result.is_error,
@@ -265,21 +324,31 @@ async function handleMessage(
         } else if (result.subtype === "error_max_budget_usd") {
           fullText += "\n\n_Hit the budget limit for this request._";
         }
-      } else if (message.type === "tool_use_summary") {
-        log("info", "tool summary", { summary: (message as any).summary });
       } else {
         log("info", "sdk message", { type: message.type, subtype: (message as any).subtype });
       }
     }
 
-    // Final update with complete text
-    await updateMessage(true);
+    // Final card update
+    await updateCard(true);
+
+    // Post response as a separate message (not edited)
+    if (fullText) {
+      await client.chat.postMessage({
+        channel,
+        thread_ts: threadTs,
+        text: fullText,
+      });
+    }
+
     log("info", "stream complete", { threadTs });
   } catch (error) {
     log("error", "claude query failed", { error: String(error), threadTs });
-    await client.chat.update({
+    status = "error";
+    await updateCard(true);
+    await client.chat.postMessage({
       channel,
-      ts: msgTs,
+      thread_ts: threadTs,
       text: fullText || "Something went wrong, try again.",
     });
   } finally {
