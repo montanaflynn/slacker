@@ -287,7 +287,7 @@ app.command("/ping", async ({ ack, respond }) => {
 app.event("app_mention", async ({ event, client, context }) => {
   log("info", "app_mention event", { user: event.user, channel: event.channel });
   const threadTs = event.thread_ts || event.ts;
-  await handleMessage(
+  handleMessage(
     event.text,
     event.channel,
     threadTs,
@@ -323,7 +323,7 @@ app.message(async ({ message, client, context }) => {
   }
 
   const threadTs = msg.thread_ts || msg.ts;
-  await handleMessage(
+  handleMessage(
     msg.text,
     msg.channel,
     threadTs,
