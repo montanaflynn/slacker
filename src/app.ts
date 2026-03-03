@@ -295,7 +295,7 @@ async function handleMessage(
 
     return {
       type: "plan",
-      title: { type: "plain_text", text: truncate(prompt, 100) },
+      title: truncate(prompt, 100),
       tasks,
     };
   }
@@ -578,7 +578,7 @@ async function shutdown(signal: string) {
         text: "Restarting — send your message again.",
         blocks: [{
           type: "plan",
-          title: { type: "plain_text", text: "Restarting — send your message again." },
+          title: "Restarting — send your message again.",
           tasks: [{
             type: "task_card",
             task_id: `${key}_restart`,
