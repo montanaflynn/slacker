@@ -7,7 +7,9 @@
     "start": "node --import tsx src/app.ts",
     "dev": "node --import tsx --watch src/app.ts",
     "setup": "node --import tsx scripts/setup.ts",
-    "update": "node --import tsx scripts/update.ts"
+    "update": "node --import tsx scripts/update.ts",
+    "logs": "ssh root@138.197.36.193 'journalctl -u slacker -f --no-pager'",
+    "logs:err": "ssh root@138.197.36.193 'journalctl -u slacker -f --no-pager -p err'"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.2.63",

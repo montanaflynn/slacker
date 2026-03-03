@@ -48,6 +48,10 @@ function listWorkspaces(): string[] {
 // Track session IDs per thread for conversation continuity
 const threadSessions = new Map<string, string>();
 
+// Track active queries so we can clean up on shutdown
+type ActiveQuery = { channel: string; msgTs: string; abort: AbortController };
+const activeQueries = new Map<string, ActiveQuery>();
+
 function log(level: "info" | "warn" | "error", msg: string, data?: Record<string, unknown>) {
   const entry = { ts: new Date().toISOString(), level, msg, ...data };
   console[level](JSON.stringify(entry));
@@ -172,11 +176,15 @@ async function handleMessage(
 
   // Resume previous session for this thread if one exists
   const previousSessionId = threadSessions.get(threadTs);
+  const abortController = new AbortController();
+  const queryKey = `${channel}:${threadTs}`;
+  activeQueries.set(queryKey, { channel, msgTs: msgTs!, abort: abortController });
 
   try {
     const response = query({
       prompt: fullPrompt,
       options: {
+        abortController,
         cwd: workspace,
         additionalDirectories: otherWorkspaces,
         ...(previousSessionId ? { resume: previousSessionId } : {}),
@@ -274,8 +282,10 @@ async function handleMessage(
     await client.chat.update({
       channel,
       ts: msgTs,
-      text: "Something went wrong, try again.",
+      text: fullText || "Something went wrong, try again.",
     });
+  } finally {
+    activeQueries.delete(queryKey);
   }
 }
 
@@ -332,6 +342,25 @@ app.message(async ({ message, client, context }) => {
     client,
   );
 });
+
+// Graceful shutdown: update any in-flight "thinking..." messages
+async function shutdown(signal: string) {
+  log("info", "shutting down", { signal, activeQueries: activeQueries.size });
+  for (const [key, { channel, msgTs, abort }] of activeQueries) {
+    abort.abort();
+    try {
+      await app.client.chat.update({
+        channel,
+        ts: msgTs,
+        text: "_Restarting — send your message again._",
+      });
+    } catch {}
+    activeQueries.delete(key);
+  }
+  process.exit(0);
+}
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
 
 (async () => {
   await app.start();
