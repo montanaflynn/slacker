@@ -332,7 +332,35 @@ async function handleMessage(
   function buildPlanBlock(): any {
     const statusMap = { thinking: "pending", working: "in_progress", done: "complete", error: "error" };
 
-    // Each activity becomes a task_card in the plan
+    // Check if there are queued tasks for this thread — if so, show task-level view
+    const threadTasks = taskStore.getByThread(teamId, threadTs);
+    if (threadTasks.length > 0) {
+      const taskCards = threadTasks.map((t) => {
+        let taskStatus: string;
+        if (t.status === "done") taskStatus = "complete";
+        else if (t.status === "active") taskStatus = "in_progress";
+        else if (t.status === "error" || t.status === "cancelled") taskStatus = "error";
+        else taskStatus = "pending"; // pending
+        return {
+          type: "task_card",
+          task_id: `task_${t.id}`,
+          title: `#${t.id}: ${t.description}`,
+          status: taskStatus,
+        };
+      });
+
+      const activeTasks = threadTasks.filter(t => t.status === "active");
+      const doneTasks = threadTasks.filter(t => t.status === "done");
+      const title = doneTasks.length === threadTasks.length
+        ? "Done"
+        : activeTasks.length > 0
+          ? `Working on task #${activeTasks[0].id}...`
+          : "Working...";
+
+      return { type: "plan", title, tasks: taskCards };
+    }
+
+    // Default: show tool-level activity for non-queued queries
     const shown = activities.slice(-10);
     const tasks: any[] = shown.length > 0
       ? shown.map((a, i) => ({
