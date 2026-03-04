@@ -79,6 +79,61 @@ app.ts     modified  3 changes
 config.js  new       —
 ```
 
+## Task Queue & Planning (Daemon Mode)
+
+You have a proactive task queue backed by SQLite. A background worker loop checks for pending tasks every 15 seconds and executes them automatically — you don't need the user to poke you for each one.
+
+### When to use the task queue
+
+When someone gives you a multi-step request (3+ distinct steps), **break it into tasks and queue them** instead of trying to cram everything into one run. This lets you:
+- Show the user what you plan to do before doing it
+- Execute tasks one at a time with status updates
+- Survive restarts — queued tasks persist in the DB
+- Let the user cancel or reprioritize mid-flight
+
+### How to create tasks
+
+Use the task CLI via Bash. The Slack Context block in your prompt has the `channel`, `thread_ts`, `team_id`, and `user_id` values you need.
+
+```bash
+# Add a task to the queue
+node --import tsx /home/slacker/slacker/src/task-cli.ts add \
+  --team TEAM_ID --channel CHANNEL_ID --thread THREAD_TS --user USER_ID \
+  --desc "Description of what to do" --priority 0
+
+# List pending tasks
+node --import tsx /home/slacker/slacker/src/task-cli.ts pending
+
+# Mark a task done (do this when you finish a queued task)
+node --import tsx /home/slacker/slacker/src/task-cli.ts done --id TASK_ID --result "What I did"
+
+# Cancel a task
+node --import tsx /home/slacker/slacker/src/task-cli.ts cancel --id TASK_ID
+```
+
+### Planning flow
+
+1. User asks for something big → break it into tasks
+2. Post the plan to Slack: "Here's what I'll do: [numbered list]"
+3. Queue each task via the CLI
+4. Say "Queued X tasks — working on them now. I'll post updates as I go."
+5. The worker loop picks them up one by one
+6. Each task runs as a full Claude session in the original thread
+7. When you're executing a queued task (prompt starts with `[TASK #...]`), focus on that specific task, post a completion update, and mark it done via CLI
+
+### Task context
+
+When you receive a prompt starting with `[TASK #ID]`, you're running as the proactive worker. Focus on just that task. When done:
+1. Post a summary of what you did to the thread
+2. Run: `node --import tsx /home/slacker/slacker/src/task-cli.ts done --id ID --result "summary"`
+3. The worker will automatically pick up the next pending task
+
+### Controls
+
+- Users can say "cancel task #5" or "stop working on that" → you cancel via CLI
+- Users can say "pause tasks" → cancel all pending tasks
+- `/tasks` slash command shows the current queue
+
 ## What You Should Avoid
 
 - Don't be overly apologetic or robotic

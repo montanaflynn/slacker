@@ -11,6 +11,7 @@ import {
   migrateFromEnv,
 } from "./installation-store.js";
 import { createSessionStore } from "./session-store.js";
+import { createTaskStore, type TaskRecord } from "./task-store.js";
 
 const { App, LogLevel } = bolt;
 
@@ -106,6 +107,9 @@ async function downloadSlackFiles(
 
 // Persistent session tracking (SQLite-backed, survives restarts)
 const sessionStore = createSessionStore();
+
+// Task queue (SQLite-backed, drives the proactive worker loop)
+const taskStore = createTaskStore();
 
 // In-memory abort controllers for active queries (can't persist these)
 type ActiveQuery = { channel: string; msgTs: string; abort: AbortController; client: any };
@@ -590,6 +594,21 @@ app.command("/changelog", async ({ ack, respond }) => {
   await respond(`*Recent changes:*\n${lines}`);
 });
 
+app.command("/tasks", async ({ ack, respond, command }) => {
+  await ack();
+  const pending = taskStore.getAllPending();
+  if (pending.length === 0) {
+    await respond("No pending or active tasks. Queue is empty.");
+    return;
+  }
+  const lines = pending.map((t: TaskRecord) => {
+    const icon = t.status === "active" ? ":large_blue_circle:" : ":white_circle:";
+    const age = Math.floor((Date.now() - new Date(t.started_at || t.created_at).getTime()) / 60000);
+    return `${icon} *#${t.id}* (${t.status}) — ${t.description}  _${age}m ago_`;
+  });
+  await respond(`*Task Queue (${pending.length}):*\n${lines.join("\n")}`);
+});
+
 app.event("app_mention", async ({ event, client, context }) => {
   log("info", "app_mention event", { user: event.user, channel: event.channel });
   const threadTs = event.thread_ts || event.ts;
@@ -701,6 +720,8 @@ async function shutdown(signal: string) {
     // DON'T mark as complete — leave as "active" so startup cleanup will resume them
     activeQueries.delete(key);
   }
+  stopWorker();
+  taskStore.close();
   sessionStore.close();
   installationStore.close();
   process.exit(0);
@@ -807,6 +828,106 @@ async function cleanupStaleSessions() {
   }
 }
 
+// --- Proactive worker loop (the "daemon" side) ---
+let workerRunning = false;
+const WORKER_INTERVAL_MS = 15_000; // Check for tasks every 15 seconds
+
+async function processNextTask() {
+  if (workerRunning) return; // Only one task at a time
+
+  const task = taskStore.getNext();
+  if (!task) return;
+
+  workerRunning = true;
+  log("info", "worker picking up task", { taskId: task.id, description: task.description });
+
+  taskStore.claim(task.id);
+
+  // Get a Slack client for this team
+  let token: string | undefined;
+  if (!useOAuth && process.env.SLACK_BOT_TOKEN) {
+    token = process.env.SLACK_BOT_TOKEN;
+  } else {
+    try {
+      const installation = await installationStore.fetchInstallation!({
+        teamId: task.team_id,
+        isEnterpriseInstall: false,
+      } as any);
+      token = (installation as any).bot?.token;
+    } catch {
+      log("warn", "could not fetch token for task", { taskId: task.id, teamId: task.team_id });
+      taskStore.complete(task.id, "error", "Could not fetch Slack token");
+      workerRunning = false;
+      return;
+    }
+  }
+
+  if (!token) {
+    taskStore.complete(task.id, "error", "No Slack token available");
+    workerRunning = false;
+    return;
+  }
+
+  const { WebClient } = await import("@slack/web-api");
+  const slackClient = new WebClient(token);
+
+  try {
+    // Post a status update in the thread
+    await slackClient.chat.postMessage({
+      channel: task.channel,
+      thread_ts: task.thread_ts,
+      text: `Working on task #${task.id}: ${task.description}`,
+    });
+
+    // Run the task through handleMessage — same pipeline as reactive messages
+    const taskPrompt = `[TASK #${task.id}] ${task.description}\n\nThis is a queued task from the proactive worker. Execute it, then when done, mark it complete by running:\nnode --import tsx /home/slacker/slacker/src/task-cli.ts done --id ${task.id} --result "summary of what you did"`;
+
+    await handleMessage(
+      taskPrompt,
+      task.channel,
+      task.thread_ts,
+      task.team_id,
+      task.user_id,
+      slackClient,
+    );
+
+    // If handleMessage didn't mark it done via CLI, mark it done now
+    const updated = taskStore.getById(task.id);
+    if (updated && updated.status === "active") {
+      taskStore.complete(task.id, "done", "Completed by worker");
+    }
+  } catch (error) {
+    log("error", "worker task failed", { taskId: task.id, error: String(error) });
+    taskStore.complete(task.id, "error", String(error));
+    try {
+      await slackClient.chat.postMessage({
+        channel: task.channel,
+        thread_ts: task.thread_ts,
+        text: `Task #${task.id} failed: ${String(error)}`,
+      });
+    } catch {}
+  } finally {
+    workerRunning = false;
+  }
+}
+
+let workerTimer: ReturnType<typeof setInterval> | null = null;
+
+function startWorker() {
+  if (workerTimer) return;
+  log("info", "starting proactive worker loop", { intervalMs: WORKER_INTERVAL_MS });
+  workerTimer = setInterval(processNextTask, WORKER_INTERVAL_MS);
+  // Also run immediately on start
+  processNextTask();
+}
+
+function stopWorker() {
+  if (workerTimer) {
+    clearInterval(workerTimer);
+    workerTimer = null;
+  }
+}
+
 (async () => {
   // Migrate existing SLACK_BOT_TOKEN: always migrate workspace dirs,
   // only store installation record when in OAuth mode
@@ -817,6 +938,9 @@ async function cleanupStaleSessions() {
 
   // Clean up any cards left as "Working..." from a previous crash/restart
   await cleanupStaleSessions();
+
+  // Start the proactive worker loop (daemon mode)
+  startWorker();
 
   console.log("\n--- AGENT.md ---\n" + botPersona + "--- END ---\n");
 })();
