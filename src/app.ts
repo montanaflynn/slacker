@@ -202,7 +202,7 @@ async function handleMessage(
   const channelName = await resolveChannelName(client, teamId, channel);
   const isDM = channelName === channel; // couldn't resolve = DM
   const workspace = isDM
-    ? resolve(WORKSPACES_ROOT, teamId, "_dm")
+    ? getWorkspacePath(teamId, "_dm")
     : getWorkspacePath(teamId, channelName);
   const otherWorkspaces = listWorkspaces(teamId)
     .filter((w) => w !== channelName && w !== "_dm")
