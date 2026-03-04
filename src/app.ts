@@ -329,38 +329,16 @@ async function handleMessage(
   let resultMeta: { turns?: number; durationMs?: number; costUsd?: number; subtype?: string } = {};
   let lastCardUpdate = 0;
 
+  // Extract task ID from prompt if this is a worker task (e.g. "[TASK #4] ...")
+  const taskMatch = text.match(/^\[TASK #(\d+)\]/);
+  const taskId = taskMatch ? parseInt(taskMatch[1], 10) : null;
+  const taskRecord = taskId ? taskStore.getById(taskId) : null;
+  const taskLabel = taskRecord ? `Task #${taskId}: ${truncate(taskRecord.description, 50)}` : null;
+
   function buildPlanBlock(): any {
     const statusMap = { thinking: "pending", working: "in_progress", done: "complete", error: "error" };
 
-    // Check if there are queued tasks for this thread — if so, show task-level view
-    const threadTasks = taskStore.getByThread(teamId, threadTs);
-    if (threadTasks.length > 0) {
-      const taskCards = threadTasks.map((t) => {
-        let taskStatus: string;
-        if (t.status === "done") taskStatus = "complete";
-        else if (t.status === "active") taskStatus = "in_progress";
-        else if (t.status === "error" || t.status === "cancelled") taskStatus = "error";
-        else taskStatus = "pending"; // pending
-        return {
-          type: "task_card",
-          task_id: `task_${t.id}`,
-          title: `#${t.id}: ${t.description}`,
-          status: taskStatus,
-        };
-      });
-
-      const activeTasks = threadTasks.filter(t => t.status === "active");
-      const doneTasks = threadTasks.filter(t => t.status === "done");
-      const title = doneTasks.length === threadTasks.length
-        ? "Done"
-        : activeTasks.length > 0
-          ? `Working on task #${activeTasks[0].id}...`
-          : "Working...";
-
-      return { type: "plan", title, tasks: taskCards };
-    }
-
-    // Default: show tool-level activity for non-queued queries
+    // Each handleMessage shows only its own tool-level activity (no combined task view)
     const shown = activities.slice(-10);
     const tasks: any[] = shown.length > 0
       ? shown.map((a, i) => ({
@@ -393,11 +371,13 @@ async function handleMessage(
       }
     }
 
-    return {
-      type: "plan",
-      title: status === "done" ? "Done" : status === "error" ? "Error" : "Working...",
-      tasks,
-    };
+    // Use task-specific title when running a queued task
+    let title: string;
+    if (status === "done") title = taskLabel ? `${taskLabel} — Done` : "Done";
+    else if (status === "error") title = taskLabel ? `${taskLabel} — Error` : "Error";
+    else title = taskLabel ? `${taskLabel}` : "Working...";
+
+    return { type: "plan", title, tasks };
   }
 
   // Post activity card
@@ -688,6 +668,187 @@ app.message(async ({ message, client, context }) => {
   );
 });
 
+// --- App Home (task dashboard) ---
+function buildAppHomeView(teamId: string): any {
+  const tasks = taskStore.getByTeam(teamId);
+  const activeTasks = tasks.filter(t => t.status === "active" || t.status === "pending");
+  const recentDone = tasks.filter(t => t.status === "done" || t.status === "error" || t.status === "cancelled").slice(0, 10);
+
+  const blocks: any[] = [
+    {
+      type: "header",
+      text: { type: "plain_text", text: "Task Dashboard", emoji: true },
+    },
+    {
+      type: "context",
+      elements: [{ type: "mrkdwn", text: `${activeTasks.length} active/pending · ${recentDone.length} recently completed` }],
+    },
+    { type: "divider" },
+  ];
+
+  if (activeTasks.length === 0 && recentDone.length === 0) {
+    blocks.push({
+      type: "section",
+      text: { type: "mrkdwn", text: "_No tasks yet. Queue tasks from any thread and they'll show up here._" },
+    });
+    return { type: "home", blocks };
+  }
+
+  // Active / pending tasks
+  if (activeTasks.length > 0) {
+    blocks.push({
+      type: "section",
+      text: { type: "mrkdwn", text: "*Active & Pending*" },
+    });
+
+    for (const t of activeTasks) {
+      const icon = t.status === "active" ? ":large_blue_circle:" : ":white_circle:";
+      const age = Math.floor((Date.now() - new Date(t.created_at).getTime()) / 60000);
+      const ageStr = age < 60 ? `${age}m` : `${Math.floor(age / 60)}h ${age % 60}m`;
+
+      const actions: any[] = [];
+      if (t.status === "pending") {
+        actions.push({
+          type: "button",
+          text: { type: "plain_text", text: "Priority +", emoji: true },
+          action_id: `task_priority_up_${t.id}`,
+          value: String(t.id),
+        });
+        actions.push({
+          type: "button",
+          text: { type: "plain_text", text: "Priority -", emoji: true },
+          action_id: `task_priority_down_${t.id}`,
+          value: String(t.id),
+        });
+      }
+      actions.push({
+        type: "button",
+        text: { type: "plain_text", text: "Cancel", emoji: true },
+        action_id: `task_cancel_${t.id}`,
+        style: "danger",
+        value: String(t.id),
+        confirm: {
+          title: { type: "plain_text", text: "Cancel task?" },
+          text: { type: "mrkdwn", text: `Cancel *#${t.id}*: ${t.description}` },
+          confirm: { type: "plain_text", text: "Cancel it" },
+          deny: { type: "plain_text", text: "Never mind" },
+        },
+      });
+
+      blocks.push({
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text: `${icon} *#${t.id}* (p${t.priority}) — ${t.description}\n_${t.status} · <slack://channel?team=${t.team_id}&id=${t.channel}&message=${t.thread_ts}|thread> · ${ageStr} ago_`,
+        },
+      });
+      blocks.push({
+        type: "actions",
+        elements: actions,
+      });
+    }
+
+    blocks.push({ type: "divider" });
+  }
+
+  // Recently completed tasks
+  if (recentDone.length > 0) {
+    blocks.push({
+      type: "section",
+      text: { type: "mrkdwn", text: "*Recently Completed*" },
+    });
+
+    for (const t of recentDone) {
+      const icon = t.status === "done" ? ":white_check_mark:" : t.status === "error" ? ":x:" : ":no_entry_sign:";
+      const resultSnippet = t.result ? ` — ${t.result.slice(0, 100)}` : "";
+      blocks.push({
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text: `${icon} *#${t.id}* — ${t.description}${resultSnippet}\n_${t.status} · <slack://channel?team=${t.team_id}&id=${t.channel}&message=${t.thread_ts}|thread>_`,
+        },
+      });
+    }
+  }
+
+  return { type: "home", blocks };
+}
+
+app.event("app_home_opened", async ({ event, client, context }) => {
+  const teamId = context.teamId!;
+  log("info", "app_home_opened", { user: event.user, teamId });
+  try {
+    await client.views.publish({
+      user_id: event.user,
+      view: buildAppHomeView(teamId),
+    });
+  } catch (error) {
+    log("error", "failed to publish app home", { error: String(error), teamId });
+  }
+});
+
+// --- App Home actions (cancel / reprioritize) ---
+app.action(/^task_cancel_\d+$/, async ({ action, ack, client, body }) => {
+  await ack();
+  const taskId = parseInt((action as any).value, 10);
+  const task = taskStore.getById(taskId);
+  if (!task || (task.status !== "pending" && task.status !== "active")) return;
+
+  taskStore.cancel(taskId);
+  log("info", "task cancelled via dashboard", { taskId });
+
+  // Refresh the home view
+  const teamId = (body as any).team?.id;
+  if (teamId) {
+    try {
+      await client.views.publish({
+        user_id: body.user.id,
+        view: buildAppHomeView(teamId),
+      });
+    } catch {}
+  }
+});
+
+app.action(/^task_priority_up_\d+$/, async ({ action, ack, client, body }) => {
+  await ack();
+  const taskId = parseInt((action as any).value, 10);
+  const task = taskStore.getById(taskId);
+  if (!task || task.status !== "pending") return;
+
+  taskStore.setPriority(taskId, task.priority + 1);
+  log("info", "task priority increased via dashboard", { taskId, newPriority: task.priority + 1 });
+
+  const teamId = (body as any).team?.id;
+  if (teamId) {
+    try {
+      await client.views.publish({
+        user_id: body.user.id,
+        view: buildAppHomeView(teamId),
+      });
+    } catch {}
+  }
+});
+
+app.action(/^task_priority_down_\d+$/, async ({ action, ack, client, body }) => {
+  await ack();
+  const taskId = parseInt((action as any).value, 10);
+  const task = taskStore.getById(taskId);
+  if (!task || task.status !== "pending") return;
+
+  taskStore.setPriority(taskId, Math.max(0, task.priority - 1));
+  log("info", "task priority decreased via dashboard", { taskId, newPriority: Math.max(0, task.priority - 1) });
+
+  const teamId = (body as any).team?.id;
+  if (teamId) {
+    try {
+      await client.views.publish({
+        user_id: body.user.id,
+        view: buildAppHomeView(teamId),
+      });
+    } catch {}
+  }
+});
+
 // --- Uninstall handling ---
 app.event("app_uninstalled" as any, async ({ context }: any) => {
   const teamId = context.teamId;
@@ -900,14 +1061,8 @@ async function processNextTask() {
   const slackClient = new WebClient(token);
 
   try {
-    // Post a status update in the thread
-    await slackClient.chat.postMessage({
-      channel: task.channel,
-      thread_ts: task.thread_ts,
-      text: `Working on task #${task.id}: ${task.description}`,
-    });
-
-    // Run the task through handleMessage — same pipeline as reactive messages
+    // Each task gets its own plan card via handleMessage (card title shows task name)
+    // No separate text announcement needed — the card IS the per-task status indicator
     const taskPrompt = `[TASK #${task.id}] ${task.description}\n\nThis is a queued task from the proactive worker. Execute it, then when done, mark it complete by running:\nnode --import tsx /home/slacker/slacker/src/task-cli.ts done --id ${task.id} --result "summary of what you did"`;
 
     await handleMessage(

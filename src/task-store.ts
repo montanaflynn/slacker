@@ -90,6 +90,20 @@ export function createTaskStore() {
     SELECT * FROM tasks WHERE id = ?
   `);
 
+  const getByTeamStmt = db.prepare(`
+    SELECT * FROM tasks
+    WHERE team_id = ?
+    ORDER BY
+      CASE status WHEN 'active' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END,
+      created_at DESC
+    LIMIT 50
+  `);
+
+  const setPriorityStmt = db.prepare(`
+    UPDATE tasks SET priority = ?
+    WHERE id = ? AND status = 'pending'
+  `);
+
   return {
     add(teamId: string, channel: string, threadTs: string, userId: string, description: string, priority = 0): number {
       const result = addStmt.run(teamId, channel, threadTs, userId, description, priority);
@@ -126,6 +140,14 @@ export function createTaskStore() {
 
     getById(id: number): TaskRecord | null {
       return (getByIdStmt.get(id) as TaskRecord) ?? null;
+    },
+
+    getByTeam(teamId: string): TaskRecord[] {
+      return getByTeamStmt.all(teamId) as TaskRecord[];
+    },
+
+    setPriority(id: number, priority: number) {
+      setPriorityStmt.run(priority, id);
     },
 
     close() {
