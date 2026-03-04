@@ -295,7 +295,7 @@ async function handleMessage(
 
     return {
       type: "plan",
-      title: truncate(prompt, 100),
+      title: status === "done" ? "Done" : status === "error" ? "Error" : "Working...",
       tasks,
     };
   }
