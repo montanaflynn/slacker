@@ -423,7 +423,7 @@ async function handleMessage(
 
   const abortController = new AbortController();
   activeQueries.set(queryKey, { channel, msgTs: cardTs!, abort: abortController, client });
-  sessionStore.register(queryKey, teamId, channel, threadTs, cardTs!);
+  sessionStore.register(queryKey, teamId, channel, threadTs, cardTs!, text, userId);
 
   let fullText = "";
 
@@ -668,7 +668,8 @@ app.event("tokens_revoked" as any, async ({ event, context }: any) => {
   }
 });
 
-// Graceful shutdown: update any in-flight "thinking..." messages
+// Graceful shutdown: abort in-flight queries but leave them "active" in DB
+// so cleanupStaleSessions() can auto-resume them on next startup.
 async function shutdown(signal: string) {
   log("info", "shutting down", { signal, activeQueries: activeQueries.size });
   for (const [key, { channel, msgTs, abort, client }] of activeQueries) {
@@ -677,20 +678,20 @@ async function shutdown(signal: string) {
       await client.chat.update({
         channel,
         ts: msgTs,
-        text: "Restarting — send your message again.",
+        text: "Restarting — will resume automatically.",
         blocks: [{
           type: "plan",
-          title: "Restarting — send your message again.",
+          title: "Restarting — will resume automatically.",
           tasks: [{
             type: "task_card",
             task_id: `${key}_restart`,
-            title: "Interrupted by restart",
-            status: "error",
+            title: "Restarting...",
+            status: "in_progress",
           }],
         }],
       });
     } catch {}
-    sessionStore.complete(key, "error");
+    // DON'T mark as complete — leave as "active" so startup cleanup will resume them
     activeQueries.delete(key);
   }
   sessionStore.close();
@@ -701,12 +702,12 @@ process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
 
 // On startup, find any sessions that were "active" when the process last died
-// and update their Slack cards to show they were interrupted.
+// and auto-resume them instead of making the user resend.
 async function cleanupStaleSessions() {
   const stale = sessionStore.getActiveSessions();
   if (stale.length === 0) return;
 
-  log("info", "cleaning up stale sessions from previous run", { count: stale.length });
+  log("info", "resuming stale sessions from previous run", { count: stale.length });
 
   // Group by team_id to minimize token lookups
   const byTeam = new Map<string, typeof stale>();
@@ -736,7 +737,7 @@ async function cleanupStaleSessions() {
     }
 
     if (!token) {
-      // Can't update cards without a token — just mark them done in DB
+      // Can't resume without a token — just mark them done in DB
       for (const s of sessions) sessionStore.complete(s.query_key, "error");
       continue;
     }
@@ -744,27 +745,57 @@ async function cleanupStaleSessions() {
     const slackClient = new WebClient(token);
 
     for (const session of sessions) {
+      // Mark the old session as interrupted in DB first
+      sessionStore.complete(session.query_key, "error");
+
+      // Update the old card to show it was interrupted
       try {
         await slackClient.chat.update({
           channel: session.channel,
           ts: session.card_ts,
-          text: "Restarting — send your message again.",
+          text: "Restarting — resuming automatically.",
           blocks: [{
             type: "plan",
-            title: "Restarting — send your message again.",
+            title: "Restarting — resuming automatically.",
             tasks: [{
               type: "task_card",
               task_id: `${session.query_key}_stale`,
-              title: "Interrupted by restart",
-              status: "error",
+              title: "Interrupted by restart — resuming",
+              status: "complete",
             }],
           }],
         });
-        log("info", "cleaned up stale session card", { queryKey: session.query_key });
       } catch (error) {
         log("warn", "failed to update stale session card", { queryKey: session.query_key, error: String(error) });
       }
-      sessionStore.complete(session.query_key, "error");
+
+      // Auto-resume: if we have the original prompt and user_id, re-invoke handleMessage
+      if (session.prompt && session.user_id) {
+        log("info", "auto-resuming interrupted query", {
+          queryKey: session.query_key,
+          channel: session.channel,
+          threadTs: session.thread_ts,
+        });
+        // Fire and forget — handleMessage manages its own lifecycle
+        handleMessage(
+          session.prompt,
+          session.channel,
+          session.thread_ts,
+          session.team_id,
+          session.user_id,
+          slackClient,
+        );
+      } else {
+        log("warn", "cannot auto-resume — missing prompt or user_id", { queryKey: session.query_key });
+        // Fall back to asking the user to resend
+        try {
+          await slackClient.chat.postMessage({
+            channel: session.channel,
+            thread_ts: session.thread_ts,
+            text: "I restarted and couldn't auto-resume this one. Send your message again and I'll pick up where I left off.",
+          });
+        } catch {}
+      }
     }
   }
 }

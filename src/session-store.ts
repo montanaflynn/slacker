@@ -17,6 +17,8 @@ export interface SessionRecord {
   status: string;
   started_at: string;
   last_heartbeat: string;
+  prompt: string | null;
+  user_id: string | null;
 }
 
 export function createSessionStore() {
@@ -34,9 +36,16 @@ export function createSessionStore() {
       session_id TEXT,
       status TEXT NOT NULL DEFAULT 'active',
       started_at TEXT NOT NULL DEFAULT (datetime('now')),
-      last_heartbeat TEXT NOT NULL DEFAULT (datetime('now'))
+      last_heartbeat TEXT NOT NULL DEFAULT (datetime('now')),
+      prompt TEXT,
+      user_id TEXT
     )
   `);
+
+  // Migrate: add prompt/user_id columns if missing (existing DBs)
+  try { db.exec(`ALTER TABLE sessions ADD COLUMN prompt TEXT`); } catch {}
+  try { db.exec(`ALTER TABLE sessions ADD COLUMN user_id TEXT`); } catch {}
+
 
   // Thread → session_id mapping for Claude session resume (persists after completion)
   db.exec(`
@@ -48,8 +57,8 @@ export function createSessionStore() {
   `);
 
   const registerStmt = db.prepare(`
-    INSERT OR REPLACE INTO sessions (query_key, team_id, channel, thread_ts, card_ts, status, started_at, last_heartbeat)
-    VALUES (?, ?, ?, ?, ?, 'active', datetime('now'), datetime('now'))
+    INSERT OR REPLACE INTO sessions (query_key, team_id, channel, thread_ts, card_ts, status, started_at, last_heartbeat, prompt, user_id)
+    VALUES (?, ?, ?, ?, ?, 'active', datetime('now'), datetime('now'), ?, ?)
   `);
 
   const heartbeatStmt = db.prepare(`
@@ -82,8 +91,8 @@ export function createSessionStore() {
   `);
 
   return {
-    register(queryKey: string, teamId: string, channel: string, threadTs: string, cardTs: string) {
-      registerStmt.run(queryKey, teamId, channel, threadTs, cardTs);
+    register(queryKey: string, teamId: string, channel: string, threadTs: string, cardTs: string, prompt?: string, userId?: string) {
+      registerStmt.run(queryKey, teamId, channel, threadTs, cardTs, prompt ?? null, userId ?? null);
     },
 
     heartbeat(queryKey: string) {
