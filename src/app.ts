@@ -10,6 +10,7 @@ import {
   createInstallationStore,
   migrateFromEnv,
 } from "./installation-store.js";
+import { createSessionStore } from "./session-store.js";
 
 const { App, LogLevel } = bolt;
 
@@ -60,22 +61,22 @@ function listWorkspaces(teamId: string): string[] {
     .map((d) => d.name);
 }
 
-// Image support — download Slack-hosted images to workspace
+// File support — download Slack-hosted files to workspace
 const IMAGE_MIMETYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
 
-async function downloadSlackImages(
+async function downloadSlackFiles(
   files: any[] | undefined,
   token: string,
   workspace: string,
-): Promise<string[]> {
-  if (!files?.length) return [];
+): Promise<{ images: string[]; other: string[] }> {
+  if (!files?.length) return { images: [], other: [] };
 
   const attachDir = resolve(workspace, ".attachments");
   mkdirSync(attachDir, { recursive: true });
 
-  const paths: string[] = [];
+  const images: string[] = [];
+  const other: string[] = [];
   for (const file of files) {
-    if (!IMAGE_MIMETYPES.has(file.mimetype)) continue;
     const url = file.url_private_download || file.url_private;
     if (!url) continue;
 
@@ -84,25 +85,29 @@ async function downloadSlackImages(
         headers: { Authorization: `Bearer ${token}` },
       });
       if (!resp.ok) {
-        log("warn", "failed to download image", { fileId: file.id, status: resp.status });
+        log("warn", "failed to download file", { fileId: file.id, status: resp.status });
         continue;
       }
       const buffer = Buffer.from(await resp.arrayBuffer());
       const safeName = `${file.id}_${file.name}`;
       const filePath = resolve(attachDir, safeName);
       writeFileSync(filePath, buffer);
-      paths.push(filePath);
+      if (IMAGE_MIMETYPES.has(file.mimetype)) {
+        images.push(filePath);
+      } else {
+        other.push(filePath);
+      }
     } catch (error) {
-      log("warn", "failed to download image", { fileId: file.id, error: String(error) });
+      log("warn", "failed to download file", { fileId: file.id, error: String(error) });
     }
   }
-  return paths;
+  return { images, other };
 }
 
-// Track session IDs per thread for conversation continuity, keyed by teamId:threadTs
-const threadSessions = new Map<string, string>();
+// Persistent session tracking (SQLite-backed, survives restarts)
+const sessionStore = createSessionStore();
 
-// Track active queries so we can clean up on shutdown
+// In-memory abort controllers for active queries (can't persist these)
 type ActiveQuery = { channel: string; msgTs: string; abort: AbortController; client: any };
 const activeQueries = new Map<string, ActiveQuery>();
 
@@ -230,8 +235,8 @@ async function handleMessage(
   files?: any[],
 ) {
   const prompt = (text || "").replace(/<@[A-Z0-9]+>/g, "").trim();
-  const hasImages = files?.some((f: any) => IMAGE_MIMETYPES.has(f.mimetype));
-  if (!prompt && !hasImages) {
+  const hasFiles = files?.length && files.length > 0;
+  if (!prompt && !hasFiles) {
     log("warn", "empty prompt after stripping mention", { channel, threadTs });
     return;
   }
@@ -249,10 +254,11 @@ async function handleMessage(
     .filter((w) => w !== channelName && w !== "_dm")
     .map((w) => resolve(WORKSPACES_ROOT, teamId, w));
 
-  // Download any attached images to workspace
-  const imagePaths = await downloadSlackImages(files, client.token, workspace);
+  // Download any attached files to workspace
+  const { images: imagePaths, other: otherPaths } = await downloadSlackFiles(files, client.token, workspace);
+  const allFilePaths = [...imagePaths, ...otherPaths];
 
-  log("info", "handling message", { prompt, channel, channelName, threadTs, userId, teamId, workspace, images: imagePaths.length });
+  log("info", "handling message", { prompt, channel, channelName, threadTs, userId, teamId, workspace, files: allFilePaths.length });
 
   const threadContext = await getThreadContext(client, channel, threadTs);
 
@@ -273,15 +279,27 @@ async function handleMessage(
       : `No other channel workspaces exist yet.`,
   ].join("\n");
 
-  const imageContext = imagePaths.length > 0
-    ? `\n\nThe user attached ${imagePaths.length} image(s). Use the Read tool to view them:\n` +
+  const attachmentParts: string[] = [];
+  if (imagePaths.length > 0) {
+    attachmentParts.push(
+      `The user attached ${imagePaths.length} image(s). Use the Read tool to view them:\n` +
       imagePaths.map((p) => `- \`${p}\``).join("\n")
+    );
+  }
+  if (otherPaths.length > 0) {
+    attachmentParts.push(
+      `The user attached ${otherPaths.length} file(s). These are saved in the workspace and you can read/use them:\n` +
+      otherPaths.map((p) => `- \`${p}\``).join("\n")
+    );
+  }
+  const fileContext = attachmentParts.length > 0
+    ? "\n\n" + attachmentParts.join("\n\n")
     : "";
 
-  const userMessage = prompt || "The user sent image(s) without any text.";
+  const userMessage = prompt || "The user sent file(s) without any text.";
   const fullPrompt = threadContext
-    ? `${slackContext}\n\nHere is the conversation so far:\n\n${threadContext}\n\nNow respond to:\n${userMessage}${imageContext}`
-    : `${slackContext}\n\n${userMessage}${imageContext}`;
+    ? `${slackContext}\n\nHere is the conversation so far:\n\n${threadContext}\n\nNow respond to:\n${userMessage}${fileContext}`
+    : `${slackContext}\n\n${userMessage}${fileContext}`;
 
   // --- Block Kit activity card ---
   // Tool label helper
@@ -363,6 +381,7 @@ async function handleMessage(
     const now = Date.now();
     if (!force && now - lastCardUpdate < 1000) return;
     lastCardUpdate = now;
+    sessionStore.heartbeat(queryKey);
     await client.chat.update({
       channel,
       ts: cardTs,
@@ -373,10 +392,38 @@ async function handleMessage(
 
   // Resume previous session for this thread if one exists (team-scoped key)
   const sessionKey = `${teamId}:${threadTs}`;
-  const previousSessionId = threadSessions.get(sessionKey);
-  const abortController = new AbortController();
+  const previousSessionId = sessionStore.getThreadSession(sessionKey);
   const queryKey = `${teamId}:${channel}:${threadTs}`;
+
+  // Cancel any in-flight query for this thread before starting a new one
+  const existing = activeQueries.get(queryKey);
+  if (existing) {
+    log("info", "aborting previous query for thread", { queryKey });
+    existing.abort.abort();
+    try {
+      await client.chat.update({
+        channel: existing.channel,
+        ts: existing.msgTs,
+        text: "Done",
+        blocks: [{
+          type: "plan",
+          title: "Done",
+          tasks: [{
+            type: "task_card",
+            task_id: `${queryKey}_cancelled`,
+            title: "Interrupted by new message",
+            status: "complete",
+          }],
+        }],
+      });
+    } catch {}
+    sessionStore.complete(queryKey, "done");
+    activeQueries.delete(queryKey);
+  }
+
+  const abortController = new AbortController();
   activeQueries.set(queryKey, { channel, msgTs: cardTs!, abort: abortController, client });
+  sessionStore.register(queryKey, teamId, channel, threadTs, cardTs!);
 
   let fullText = "";
 
@@ -413,7 +460,8 @@ async function handleMessage(
     for await (const message of response) {
       if (message.type === "system" && "subtype" in message && message.subtype === "init") {
         if (message.session_id) {
-          threadSessions.set(sessionKey, message.session_id);
+          sessionStore.setThreadSession(sessionKey, message.session_id);
+          sessionStore.setSessionId(queryKey, message.session_id);
         }
         log("info", "sdk init", {
           sessionId: message.session_id,
@@ -455,6 +503,7 @@ async function handleMessage(
           subtype: result.subtype,
         };
         status = result.subtype === "success" ? "done" : "error";
+        sessionStore.complete(queryKey, status);
         // Mark all remaining activities as complete (or error)
         for (const a of activities) {
           if (a.status !== "complete") a.status = status === "done" ? "complete" : "error";
@@ -498,6 +547,7 @@ async function handleMessage(
   } catch (error) {
     log("error", "claude query failed", { error: String(error), threadTs });
     status = "error";
+    sessionStore.complete(queryKey, "error");
     await updateCard(true);
     await client.chat.postMessage({
       channel,
@@ -640,13 +690,84 @@ async function shutdown(signal: string) {
         }],
       });
     } catch {}
+    sessionStore.complete(key, "error");
     activeQueries.delete(key);
   }
+  sessionStore.close();
   installationStore.close();
   process.exit(0);
 }
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
+
+// On startup, find any sessions that were "active" when the process last died
+// and update their Slack cards to show they were interrupted.
+async function cleanupStaleSessions() {
+  const stale = sessionStore.getActiveSessions();
+  if (stale.length === 0) return;
+
+  log("info", "cleaning up stale sessions from previous run", { count: stale.length });
+
+  // Group by team_id to minimize token lookups
+  const byTeam = new Map<string, typeof stale>();
+  for (const s of stale) {
+    const arr = byTeam.get(s.team_id) || [];
+    arr.push(s);
+    byTeam.set(s.team_id, arr);
+  }
+
+  const { WebClient } = await import("@slack/web-api");
+
+  for (const [teamId, sessions] of byTeam) {
+    let token: string | undefined;
+
+    if (!useOAuth && process.env.SLACK_BOT_TOKEN) {
+      token = process.env.SLACK_BOT_TOKEN;
+    } else {
+      try {
+        const installation = await installationStore.fetchInstallation!({
+          teamId,
+          isEnterpriseInstall: false,
+        } as any);
+        token = (installation as any).bot?.token;
+      } catch {
+        log("warn", "could not fetch token for stale session cleanup", { teamId });
+      }
+    }
+
+    if (!token) {
+      // Can't update cards without a token — just mark them done in DB
+      for (const s of sessions) sessionStore.complete(s.query_key, "error");
+      continue;
+    }
+
+    const slackClient = new WebClient(token);
+
+    for (const session of sessions) {
+      try {
+        await slackClient.chat.update({
+          channel: session.channel,
+          ts: session.card_ts,
+          text: "Restarting — send your message again.",
+          blocks: [{
+            type: "plan",
+            title: "Restarting — send your message again.",
+            tasks: [{
+              type: "task_card",
+              task_id: `${session.query_key}_stale`,
+              title: "Interrupted by restart",
+              status: "error",
+            }],
+          }],
+        });
+        log("info", "cleaned up stale session card", { queryKey: session.query_key });
+      } catch (error) {
+        log("warn", "failed to update stale session card", { queryKey: session.query_key, error: String(error) });
+      }
+      sessionStore.complete(session.query_key, "error");
+    }
+  }
+}
 
 (async () => {
   // Migrate existing SLACK_BOT_TOKEN: always migrate workspace dirs,
@@ -655,5 +776,9 @@ process.on("SIGINT", () => shutdown("SIGINT"));
 
   await app.start();
   log("info", "cofounder started", { mode: useOAuth ? "oauth" : "legacy" });
+
+  // Clean up any cards left as "Working..." from a previous crash/restart
+  await cleanupStaleSessions();
+
   console.log("\n--- AGENT.md ---\n" + botPersona + "--- END ---\n");
 })();
