@@ -1,5 +1,5 @@
 import "dotenv/config";
-import { readFileSync, mkdirSync, readdirSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, readdirSync, existsSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -58,6 +58,45 @@ function listWorkspaces(teamId: string): string[] {
   return readdirSync(teamRoot, { withFileTypes: true })
     .filter((d) => d.isDirectory())
     .map((d) => d.name);
+}
+
+// Image support — download Slack-hosted images to workspace
+const IMAGE_MIMETYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
+
+async function downloadSlackImages(
+  files: any[] | undefined,
+  token: string,
+  workspace: string,
+): Promise<string[]> {
+  if (!files?.length) return [];
+
+  const attachDir = resolve(workspace, ".attachments");
+  mkdirSync(attachDir, { recursive: true });
+
+  const paths: string[] = [];
+  for (const file of files) {
+    if (!IMAGE_MIMETYPES.has(file.mimetype)) continue;
+    const url = file.url_private_download || file.url_private;
+    if (!url) continue;
+
+    try {
+      const resp = await fetch(url, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!resp.ok) {
+        log("warn", "failed to download image", { fileId: file.id, status: resp.status });
+        continue;
+      }
+      const buffer = Buffer.from(await resp.arrayBuffer());
+      const safeName = `${file.id}_${file.name}`;
+      const filePath = resolve(attachDir, safeName);
+      writeFileSync(filePath, buffer);
+      paths.push(filePath);
+    } catch (error) {
+      log("warn", "failed to download image", { fileId: file.id, error: String(error) });
+    }
+  }
+  return paths;
 }
 
 // Track session IDs per thread for conversation continuity, keyed by teamId:threadTs
@@ -188,9 +227,11 @@ async function handleMessage(
   teamId: string,
   userId: string,
   client: any,
+  files?: any[],
 ) {
-  const prompt = text.replace(/<@[A-Z0-9]+>/g, "").trim();
-  if (!prompt) {
+  const prompt = (text || "").replace(/<@[A-Z0-9]+>/g, "").trim();
+  const hasImages = files?.some((f: any) => IMAGE_MIMETYPES.has(f.mimetype));
+  if (!prompt && !hasImages) {
     log("warn", "empty prompt after stripping mention", { channel, threadTs });
     return;
   }
@@ -208,7 +249,10 @@ async function handleMessage(
     .filter((w) => w !== channelName && w !== "_dm")
     .map((w) => resolve(WORKSPACES_ROOT, teamId, w));
 
-  log("info", "handling message", { prompt, channel, channelName, threadTs, userId, teamId, workspace });
+  // Download any attached images to workspace
+  const imagePaths = await downloadSlackImages(files, client.token, workspace);
+
+  log("info", "handling message", { prompt, channel, channelName, threadTs, userId, teamId, workspace, images: imagePaths.length });
 
   const threadContext = await getThreadContext(client, channel, threadTs);
 
@@ -229,9 +273,15 @@ async function handleMessage(
       : `No other channel workspaces exist yet.`,
   ].join("\n");
 
+  const imageContext = imagePaths.length > 0
+    ? `\n\nThe user attached ${imagePaths.length} image(s). Use the Read tool to view them:\n` +
+      imagePaths.map((p) => `- \`${p}\``).join("\n")
+    : "";
+
+  const userMessage = prompt || "The user sent image(s) without any text.";
   const fullPrompt = threadContext
-    ? `${slackContext}\n\nHere is the conversation so far:\n\n${threadContext}\n\nNow respond to:\n${prompt}`
-    : `${slackContext}\n\n${prompt}`;
+    ? `${slackContext}\n\nHere is the conversation so far:\n\n${threadContext}\n\nNow respond to:\n${userMessage}${imageContext}`
+    : `${slackContext}\n\n${userMessage}${imageContext}`;
 
   // --- Block Kit activity card ---
   // Tool label helper
@@ -493,13 +543,14 @@ app.event("app_mention", async ({ event, client, context }) => {
     context.teamId!,
     event.user!,
     client,
+    (event as any).files,
   );
 });
 
 app.message(async ({ message, client, context }) => {
   const msg = message as any;
   log("info", "message event", { channelType: msg.channel_type, subtype: msg.subtype, user: msg.user });
-  if (msg.subtype) return;
+  if (msg.subtype && msg.subtype !== "file_share") return;
 
   const isDM = msg.channel_type === "im";
   const isThreadReply = !!msg.thread_ts;
@@ -529,6 +580,7 @@ app.message(async ({ message, client, context }) => {
     context.teamId!,
     msg.user,
     client,
+    msg.files,
   );
 });
 
