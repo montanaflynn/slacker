@@ -545,15 +545,22 @@ async function handleMessage(
 
     log("info", "stream complete", { threadTs });
   } catch (error) {
-    log("error", "claude query failed", { error: String(error), threadTs });
-    status = "error";
-    sessionStore.complete(queryKey, "error");
-    await updateCard(true);
-    await client.chat.postMessage({
-      channel,
-      thread_ts: threadTs,
-      text: fullText || "Something went wrong, try again.",
-    });
+    const isAbort = abortController.signal.aborted || String(error).includes("aborted");
+    if (isAbort) {
+      // Intentional abort (new message in thread or shutdown) — don't post error message.
+      // The aborting code already updated the card.
+      log("info", "query aborted", { threadTs });
+    } else {
+      log("error", "claude query failed", { error: String(error), threadTs });
+      status = "error";
+      sessionStore.complete(queryKey, "error");
+      await updateCard(true);
+      await client.chat.postMessage({
+        channel,
+        thread_ts: threadTs,
+        text: fullText || "Something went wrong, try again.",
+      });
+    }
   } finally {
     activeQueries.delete(queryKey);
   }
