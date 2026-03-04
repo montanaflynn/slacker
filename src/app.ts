@@ -12,6 +12,7 @@ import {
 } from "./installation-store.js";
 import { createSessionStore } from "./session-store.js";
 import { createTaskStore, type TaskRecord } from "./task-store.js";
+import { activity } from "./activity.js";
 
 const { App, LogLevel } = bolt;
 
@@ -149,6 +150,8 @@ const app = new App({
           "reactions:write",
           "pins:write",
           "channels:read",
+          "channels:manage",
+          "groups:write",
           "users:read",
           "canvases:write",
         ],
@@ -263,6 +266,9 @@ async function handleMessage(
   const allFilePaths = [...imagePaths, ...otherPaths];
 
   log("info", "handling message", { prompt, channel, channelName, threadTs, userId, teamId, workspace, files: allFilePaths.length });
+
+  // Post activity event (non-blocking, best-effort)
+  activity.messageStart(client, teamId, channel, threadTs, userId, prompt);
 
   const threadContext = await getThreadContext(client, channel, threadTs);
 
@@ -412,6 +418,7 @@ async function handleMessage(
   if (existing) {
     log("info", "aborting previous query for thread", { queryKey });
     existing.abort.abort();
+    activity.messageAborted(client, teamId, channel);
     try {
       await client.chat.update({
         channel: existing.channel,
@@ -463,6 +470,7 @@ async function handleMessage(
           "mcp__slack__list_channels",
           "mcp__slack__user_info",
           "mcp__slack__pin_message",
+          "mcp__slack__create_channel",
         ],
         mcpServers: { slack: slackTools },
         permissionMode: "bypassPermissions",
@@ -516,6 +524,13 @@ async function handleMessage(
         };
         status = result.subtype === "success" ? "done" : "error";
         sessionStore.complete(queryKey, status);
+
+        // Post activity event
+        if (status === "done") {
+          activity.messageDone(client, teamId, channel, resultMeta);
+        } else {
+          activity.messageError(client, teamId, channel, result.errors?.join(", "));
+        }
         // Mark all remaining activities as complete (or error)
         for (const a of activities) {
           if (a.status !== "complete") a.status = status === "done" ? "complete" : "error";
@@ -620,11 +635,21 @@ app.command("/tasks", async ({ ack, respond, command }) => {
 app.event("app_mention", async ({ event, client, context }) => {
   log("info", "app_mention event", { user: event.user, channel: event.channel });
   const threadTs = event.thread_ts || event.ts;
+  const teamId = context.teamId!;
+  const isNewThread = !event.thread_ts;
+  if (isNewThread) {
+    activity.newThread(client, teamId, event.channel, event.user!);
+  } else {
+    activity.threadReply(client, teamId, event.channel, event.user!);
+  }
+  if ((event as any).files?.length) {
+    activity.fileReceived(client, teamId, event.channel, event.user!, (event as any).files.length);
+  }
   handleMessage(
     event.text,
     event.channel,
     threadTs,
-    context.teamId!,
+    teamId,
     event.user!,
     client,
     (event as any).files,
@@ -657,11 +682,20 @@ app.message(async ({ message, client, context }) => {
   }
 
   const threadTs = msg.thread_ts || msg.ts;
+  const teamId = context.teamId!;
+  if (isDM && !isThreadReply) {
+    activity.newDM(client, teamId, msg.channel, msg.user);
+  } else if (isThreadReply) {
+    activity.threadReply(client, teamId, msg.channel, msg.user);
+  }
+  if (msg.files?.length) {
+    activity.fileReceived(client, teamId, msg.channel, msg.user, msg.files.length);
+  }
   handleMessage(
     msg.text,
     msg.channel,
     threadTs,
-    context.teamId!,
+    teamId,
     msg.user,
     client,
     msg.files,
@@ -799,6 +833,7 @@ app.action(/^task_cancel_\d+$/, async ({ action, ack, client, body }) => {
 
   // Refresh the home view
   const teamId = (body as any).team?.id;
+  if (teamId) activity.taskCancelled(client, teamId, taskId);
   if (teamId) {
     try {
       await client.views.publish({
@@ -887,6 +922,26 @@ app.event("tokens_revoked" as any, async ({ event, context }: any) => {
 // so cleanupStaleSessions() can auto-resume them on next startup.
 async function shutdown(signal: string) {
   log("info", "shutting down", { signal, activeQueries: activeQueries.size });
+
+  // Post shutdown activity
+  try {
+    const { WebClient } = await import("@slack/web-api");
+    let token = process.env.SLACK_BOT_TOKEN;
+    if (!token) {
+      try {
+        const inst = await installationStore.fetchInstallation!({
+          teamId: "T0ACDR0HHPG",
+          isEnterpriseInstall: false,
+        } as any);
+        token = (inst as any).bot?.token;
+      } catch {}
+    }
+    if (token) {
+      const c = new WebClient(token);
+      const auth = await c.auth.test();
+      if (auth.team_id) await activity.shutdown(c, auth.team_id);
+    }
+  } catch {}
   for (const [key, { channel, msgTs, abort, client }] of activeQueries) {
     abort.abort();
     try {
@@ -993,6 +1048,7 @@ async function cleanupStaleSessions() {
           channel: session.channel,
           threadTs: session.thread_ts,
         });
+        activity.sessionResumed(slackClient, teamId, session.channel, session.thread_ts);
         // Fire and forget — handleMessage manages its own lifecycle
         handleMessage(
           session.prompt,
@@ -1060,6 +1116,9 @@ async function processNextTask() {
   const { WebClient } = await import("@slack/web-api");
   const slackClient = new WebClient(token);
 
+  // Post activity event for task start
+  activity.taskStart(slackClient, task.team_id, task.id, task.description);
+
   try {
     // Each task gets its own plan card via handleMessage (card title shows task name)
     // No separate text announcement needed — the card IS the per-task status indicator
@@ -1079,9 +1138,11 @@ async function processNextTask() {
     if (updated && updated.status === "active") {
       taskStore.complete(task.id, "done", "Completed by worker");
     }
+    activity.taskDone(slackClient, task.team_id, task.id, "Completed");
   } catch (error) {
     log("error", "worker task failed", { taskId: task.id, error: String(error) });
     taskStore.complete(task.id, "error", String(error));
+    activity.taskError(slackClient, task.team_id, task.id, String(error));
     try {
       await slackClient.chat.postMessage({
         channel: task.channel,
@@ -1118,6 +1179,42 @@ function stopWorker() {
 
   await app.start();
   log("info", "cofounder started", { mode: useOAuth ? "oauth" : "legacy" });
+
+  // Post startup activity to all known teams
+  {
+    const { WebClient } = await import("@slack/web-api");
+    // Try env token first, then fall back to installation store
+    let token = process.env.SLACK_BOT_TOKEN;
+    let teamId: string | undefined;
+
+    if (token) {
+      try {
+        const c = new WebClient(token);
+        const auth = await c.auth.test();
+        teamId = auth.team_id ?? undefined;
+        if (teamId) activity.startup(c, teamId, gitCommit);
+      } catch {
+        token = undefined; // env token is stale, try installation store
+      }
+    }
+
+    if (!token) {
+      // OAuth mode: get token from installation store
+      try {
+        const installation = await installationStore.fetchInstallation!({
+          teamId: "T0ACDR0HHPG", // TODO: enumerate all teams
+          isEnterpriseInstall: false,
+        } as any);
+        const botToken = (installation as any).bot?.token;
+        if (botToken) {
+          const c = new WebClient(botToken);
+          const auth = await c.auth.test();
+          teamId = auth.team_id ?? undefined;
+          if (teamId) activity.startup(c, teamId, gitCommit);
+        }
+      } catch {}
+    }
+  }
 
   // Clean up any cards left as "Working..." from a previous crash/restart
   await cleanupStaleSessions();
